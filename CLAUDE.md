@@ -104,81 +104,22 @@ systemctl daemon-reload && systemctl restart pinging-monitor
 
 ---
 
-## Active Work: WebRTC not connecting (in progress as of 2026-04-14)
+## WebRTC — Fully Working (resolved 2026-04-14)
 
-**Status:** HTTP and DNS monitoring work correctly. WebRTC is still failing. The latest
-`app.py` commit (`378edd6`) has diagnostic logging in place and the current best fix
-attempt is deployed but not yet confirmed working.
+All three monitoring loops (HTTP, WebRTC, DNS) are confirmed working on CT 113.
 
-### What we know
+### The problems we fixed and why
 
-**The upstream browser behaviour (from [benhansen-io/pinging](https://github.com/benhansen-io/pinging) `frontend/index.ts`):**
-```js
-const offer = await rtcPeer.createOffer();
-await rtcPeer.setLocalDescription(offer);
-// Sends localDescription.sdp IMMEDIATELY — no waiting, no filtering
-fetch("/new_rtc_session?...", { method: "POST", body: rtcPeer.localDescription.sdp })
-```
-The browser SDP has zero candidates and one `a=fingerprint:sha-256` line. Total size is
-well under pinging.net's payload limit.
+pinging.net's server uses [webrtc-unreliable](https://github.com/kyren/webrtc-unreliable)
+v0.6, a Rust crate that is data-channel-only and non-standard in several ways. aiortc is
+designed for media WebRTC and assumes a compliant peer. Four incompatibilities needed
+monkey-patching, applied at module level in `app.py` before any session is created:
 
-**The aiortc difference:**
-- aiortc gathers ICE candidates eagerly **inside `createOffer()`** (before `setLocalDescription`),
-  so `offer.sdp` already contains a host candidate and an srflx candidate.
-- aiortc includes **three** DTLS fingerprints (sha-256, sha-384, sha-512); browsers send only sha-256.
-- Together these push the SDP to ~1039 bytes, triggering a **413 Payload Too Large** from
-  pinging.net's `/new_rtc_session` endpoint.
+| # | Problem | Root cause | Fix |
+|---|---|---|---|
+| 1 | SDP 413 Payload Too Large | aiortc embeds ICE candidates + 3 fingerprints in the offer (~1 kB); pinging.net rejects anything over ~500 B | Strip `a=candidate:`, `a=end-of-candidates`, and non-sha-256 `a=fingerprint:` lines before POSTing; replace `a=setup:actpass` with `a=setup:active` |
+| 2 | `DTLS handshake failed (error )` — empty | aiortc offers only ECDHE-ECDSA ciphers; server has an RSA cert → `handshake_failure` alert | Patch `SSL.Context.set_cipher_list` to append RSA equivalents of every ECDSA suite |
+| 3 | `CryptographyDeprecationWarning` + connection fail | Server cert has serial=0 (invalid per RFC 5280); cryptography 42+ raises on load | Patch `OpenSSL.crypto.X509.to_cryptography` to catch the exception and reload via raw DER |
+| 4 | `DTLS handshake failed (no SRTP profile negotiated)` | aiortc unconditionally requires SRTP negotiation even for pure data-channel connections; pinging.net never offers `use_srtp` | Patch `RTCDtlsTransport._setup_srtp` to unconditionally return (SRTP keying material is unused for SCTP) |
 
-**Fix in `_webrtc_session()` (current state in app.py):**
-```python
-# Strip all candidates and non-sha-256 fingerprints before sending
-sdp_lines = [
-    line for line in offer.sdp.splitlines()
-    if not line.startswith("a=candidate:")
-    and not line.startswith("a=end-of-candidates")
-    and not (
-        line.startswith("a=fingerprint:")
-        and not line.startswith("a=fingerprint:sha-256")
-    )
-]
-sdp_to_send = "\r\n".join(sdp_lines) + "\r\n"
-```
-This should produce a ~480 byte SDP matching what a browser sends. **Not yet confirmed
-working** — test was in flight at compact time.
-
-**Previous failure mode (before the 413 was fixed):**
-When a 200 response was received from the server, ICE negotiation completed successfully
-(`ICE completed` in the aioice logs), but the WebRTC data channel never opened
-(`WebRTC channel did not open within 15s`). The connection state went directly
-`new → closed` (from our own `pc.close()` in the finally block) — it never reached
-`connecting`, meaning DTLS never started.
-
-### What to do after compact
-
-1. **Check if the 413 is fixed:** Run `journalctl -u pinging-monitor -f` on CT 113
-   (`192.168.4.188`). Look for `WebRTC SDP offer (NNN bytes, 0 candidate lines)` — NNN
-   should be ~480. If still 413, the new code wasn't pulled; run:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main/app.py \
-     -o /opt/pinging-monitor/app.py && systemctl restart pinging-monitor
-   ```
-
-2. **If 413 is gone but channel still doesn't open:** The server response is now logged
-   (`WebRTC server response: {...}`). Paste it here. Key things to check in the response:
-   - `answer.sdp` — look for `a=setup:` (active = server initiates DTLS, passive = we initiate)
-   - `candidate` — the ICE candidate the server sends back
-   The DTLS not starting suggests either a role mismatch (server expects us to initiate but
-   aiortc is waiting for server) or the server can't reach us (no candidates in our offer
-   means server doesn't know our address until it sees our STUN binding requests).
-
-3. **If DTLS is the remaining issue:** Consider patching the SDP to force
-   `a=setup:active` (making aiortc initiate DTLS to the server):
-   ```python
-   sdp_to_send = sdp_to_send.replace("a=setup:actpass", "a=setup:active")
-   ```
-   This makes aiortc the DTLS client, initiating to the server after ICE — the server
-   doesn't need to know our address to start DTLS.
-
-4. **If WebRTC simply won't work with aiortc:** Set `WEBRTC_ENABLED=false` in the
-   systemd service. HTTP and DNS tests are fully working and give good monitoring coverage.
-   WebRTC can be revisited when submitting to community-scripts.
+All four patches are in the `# Monkey-patch` blocks near the top of `app.py`.

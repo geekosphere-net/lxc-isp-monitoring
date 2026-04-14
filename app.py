@@ -127,9 +127,6 @@ try:
 except Exception as _e:
     logger.warning("Could not patch RTCDtlsTransport._setup_srtp: %s", _e)
 
-# Temporarily re-enable aiortc DEBUG logging to see the cert/fingerprint step
-logging.getLogger("aiortc").setLevel(logging.DEBUG)
-
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/monitor.db"))
 TARGET_HOST = os.environ.get("TARGET_HOST", "https://pinging.net")
 PING_INTERVAL = float(os.environ.get("PING_INTERVAL", "1.0"))
