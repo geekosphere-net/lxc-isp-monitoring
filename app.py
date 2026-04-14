@@ -88,11 +88,9 @@ try:
             except Exception:
                 # Fall back: load raw DER bytes via a relaxed backend path so
                 # aiortc can still compute the SHA-256 fingerprint.
-                from cryptography.hazmat.primitives.serialization import Encoding
                 from cryptography.x509 import load_der_x509_certificate
-                from cryptography.hazmat.backends import default_backend
                 der = _crypto.dump_certificate(_crypto.FILETYPE_ASN1, self)
-                return load_der_x509_certificate(der, default_backend())
+                return load_der_x509_certificate(der)
 
     _crypto.X509.to_cryptography = _patched_to_cryptography  # type: ignore[method-assign]
     logger.info("Patched OpenSSL X509.to_cryptography to tolerate zero serial number")
@@ -120,11 +118,9 @@ try:
         # pinging.net's webrtc-unreliable server is data-channel only and never
         # negotiates an SRTP profile. aiortc's _setup_srtp() unconditionally
         # requires one, but SRTP keying material is unused for SCTP data channels.
-        # Skip setup when no profile was negotiated; the connection proceeds to
-        # CONNECTED and SCTP runs normally over the DTLS tunnel.
-        if self._ssl is not None and self._ssl.get_selected_srtp_profile() is None:
-            return
-        _orig_setup_srtp(self)
+        # Unconditionally skip — SRTP is never needed for this data-channel-only
+        # connection regardless of what get_selected_srtp_profile() returns.
+        return
 
     _RTCDtlsTransport._setup_srtp = _patched_setup_srtp  # type: ignore[method-assign]
     logger.info("Patched RTCDtlsTransport._setup_srtp to skip SRTP for data-channel-only server")
