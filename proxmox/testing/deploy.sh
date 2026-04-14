@@ -135,15 +135,19 @@ msg_ok "Network reachable"
 # -----------------------------------------------------------------------------
 # Run install script inside the container
 # -----------------------------------------------------------------------------
+msg_info "Installing curl in container"
+pct exec "$CT_ID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
+msg_ok "curl installed"
+
 msg_info "Running install script"
 pct exec "$CT_ID" -- bash -c "
+  set -euo pipefail
   FUNCTIONS_FILE_PATH=\$(curl -fsSL ${INSTALL_FUNC_URL})
   export FUNCTIONS_FILE_PATH
   curl -fsSL ${INSTALL_SCRIPT_URL} -o /tmp/pinging-install.sh
   bash /tmp/pinging-install.sh
   rm -f /tmp/pinging-install.sh
-"
-msg_ok "Install complete"
+" && msg_ok "Install complete" || msg_error "Install script failed — check output above"
 
 # -----------------------------------------------------------------------------
 # Done
