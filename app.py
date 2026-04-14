@@ -341,7 +341,6 @@ async def api_stats(hours: int = 24) -> dict:
     cutoff = int((time.time() - hours * 3600) * 1000)
     stats: dict = {}
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
         for type_ in ("http", "webrtc", "dns"):
             async with db.execute(
                 """
@@ -356,16 +355,17 @@ async def api_stats(hours: int = 24) -> dict:
                 """,
                 (cutoff, type_),
             ) as cursor:
-                row = dict(await cursor.fetchone())
-            total = row["total"] or 0
-            ok = row["ok"] or 0
+                row = await cursor.fetchone()
+            total = (row[0] or 0) if row else 0
+            ok = (row[1] or 0) if row else 0
+            avg_rtt, min_rtt, max_rtt = (row[2], row[3], row[4]) if row else (None, None, None)
             stats[type_] = {
                 "total": total,
                 "uptime_pct": round(ok / total * 100, 2) if total else None,
                 "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
-                "avg_rtt": round(row["avg_rtt"], 1) if row["avg_rtt"] is not None else None,
-                "min_rtt": round(row["min_rtt"], 1) if row["min_rtt"] is not None else None,
-                "max_rtt": round(row["max_rtt"], 1) if row["max_rtt"] is not None else None,
+                "avg_rtt": round(avg_rtt, 1) if avg_rtt is not None else None,
+                "min_rtt": round(min_rtt, 1) if min_rtt is not None else None,
+                "max_rtt": round(max_rtt, 1) if max_rtt is not None else None,
             }
     return stats
 
