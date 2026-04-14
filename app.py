@@ -216,6 +216,10 @@ async def _webrtc_session() -> None:
             )
         ]
         sdp_to_send = "\r\n".join(sdp_lines) + "\r\n"
+        # Force aiortc to be the DTLS initiator — the server always responds with
+        # a=setup:passive, but aiortc doesn't reliably transition from actpass to
+        # active when parsing the answer, causing an immediate connection failure.
+        sdp_to_send = sdp_to_send.replace("a=setup:actpass", "a=setup:active")
         logger.info(
             "WebRTC SDP offer (%d bytes, %d candidate lines):\n%s",
             len(sdp_to_send),
