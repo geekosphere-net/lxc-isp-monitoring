@@ -28,9 +28,38 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
-# Surface the DTLS error that aiortc swallows silently at DEBUG level
-logging.getLogger("aiortc").setLevel(logging.DEBUG)
-logging.getLogger("dtls").setLevel(logging.DEBUG)
+# ---------------------------------------------------------------------------
+# Monkey-patch: add RSA cipher suites to aiortc's DTLS SSL context.
+#
+# aiortc defaults to ECDHE-ECDSA-only ciphers, but pinging.net's
+# webrtc-unreliable server presents an RSA certificate.  A server with an
+# RSA cert cannot use any ECDSA cipher suite, so the handshake immediately
+# fails with an empty handshake_failure alert (no matching cipher).
+# Browsers work because they offer both ECDSA and RSA variants.
+# Intercepting set_cipher_list() adds the RSA equivalents transparently,
+# without modifying the installed aiortc package.
+# ---------------------------------------------------------------------------
+try:
+    from OpenSSL import SSL as _SSL
+
+    _orig_set_cipher_list = _SSL.Context.set_cipher_list
+
+    def _patched_set_cipher_list(self, cipher_list: bytes) -> None:
+        if isinstance(cipher_list, str):
+            cipher_list = cipher_list.encode()
+        if b"ECDHE-ECDSA" in cipher_list and b"ECDHE-RSA" not in cipher_list:
+            rsa_suites = b":".join(
+                s.replace(b"ECDSA", b"RSA")
+                for s in cipher_list.split(b":")
+                if b"ECDSA" in s
+            )
+            cipher_list = cipher_list + b":" + rsa_suites
+        _orig_set_cipher_list(self, cipher_list)
+
+    _SSL.Context.set_cipher_list = _patched_set_cipher_list  # type: ignore[method-assign]
+    logger.info("Patched aiortc DTLS cipher list to include RSA suites")
+except Exception as _e:
+    logger.warning("Could not patch DTLS cipher list: %s", _e)
 
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/monitor.db"))
 TARGET_HOST = os.environ.get("TARGET_HOST", "https://pinging.net")
