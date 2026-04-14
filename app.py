@@ -112,16 +112,24 @@ except Exception as _e:
 # material aiortc derives afterwards is never used for SCTP data channels.
 # ---------------------------------------------------------------------------
 try:
-    _orig_get_srtp_profile = _SSL.Connection.get_selected_srtp_profile
+    from aiortc.rtcdtlstransport import RTCDtlsTransport as _RTCDtlsTransport
 
-    def _patched_get_srtp_profile(self) -> str:
-        result = _orig_get_srtp_profile(self)
-        return result if result is not None else "SRTP_AES128_CM_SHA1_80"
+    _orig_setup_srtp = _RTCDtlsTransport._setup_srtp  # type: ignore[attr-defined]
 
-    _SSL.Connection.get_selected_srtp_profile = _patched_get_srtp_profile  # type: ignore[method-assign]
-    logger.info("Patched SSL.Connection.get_selected_srtp_profile for data-channel-only server")
+    def _patched_setup_srtp(self) -> None:  # type: ignore[no-untyped-def]
+        # pinging.net's webrtc-unreliable server is data-channel only and never
+        # negotiates an SRTP profile. aiortc's _setup_srtp() unconditionally
+        # requires one, but SRTP keying material is unused for SCTP data channels.
+        # Skip setup when no profile was negotiated; the connection proceeds to
+        # CONNECTED and SCTP runs normally over the DTLS tunnel.
+        if self._ssl is not None and self._ssl.get_selected_srtp_profile() is None:
+            return
+        _orig_setup_srtp(self)
+
+    _RTCDtlsTransport._setup_srtp = _patched_setup_srtp  # type: ignore[method-assign]
+    logger.info("Patched RTCDtlsTransport._setup_srtp to skip SRTP for data-channel-only server")
 except Exception as _e:
-    logger.warning("Could not patch get_selected_srtp_profile: %s", _e)
+    logger.warning("Could not patch RTCDtlsTransport._setup_srtp: %s", _e)
 
 # Temporarily re-enable aiortc DEBUG logging to see the cert/fingerprint step
 logging.getLogger("aiortc").setLevel(logging.DEBUG)
