@@ -101,3 +101,84 @@ systemctl daemon-reload && systemctl restart pinging-monitor
 - `httpx` — async HTTP client
 - `fastapi` + `uvicorn` — web server
 - `aiosqlite` — async SQLite
+
+---
+
+## Active Work: WebRTC not connecting (in progress as of 2026-04-14)
+
+**Status:** HTTP and DNS monitoring work correctly. WebRTC is still failing. The latest
+`app.py` commit (`378edd6`) has diagnostic logging in place and the current best fix
+attempt is deployed but not yet confirmed working.
+
+### What we know
+
+**The upstream browser behaviour (from [benhansen-io/pinging](https://github.com/benhansen-io/pinging) `frontend/index.ts`):**
+```js
+const offer = await rtcPeer.createOffer();
+await rtcPeer.setLocalDescription(offer);
+// Sends localDescription.sdp IMMEDIATELY — no waiting, no filtering
+fetch("/new_rtc_session?...", { method: "POST", body: rtcPeer.localDescription.sdp })
+```
+The browser SDP has zero candidates and one `a=fingerprint:sha-256` line. Total size is
+well under pinging.net's payload limit.
+
+**The aiortc difference:**
+- aiortc gathers ICE candidates eagerly **inside `createOffer()`** (before `setLocalDescription`),
+  so `offer.sdp` already contains a host candidate and an srflx candidate.
+- aiortc includes **three** DTLS fingerprints (sha-256, sha-384, sha-512); browsers send only sha-256.
+- Together these push the SDP to ~1039 bytes, triggering a **413 Payload Too Large** from
+  pinging.net's `/new_rtc_session` endpoint.
+
+**Fix in `_webrtc_session()` (current state in app.py):**
+```python
+# Strip all candidates and non-sha-256 fingerprints before sending
+sdp_lines = [
+    line for line in offer.sdp.splitlines()
+    if not line.startswith("a=candidate:")
+    and not line.startswith("a=end-of-candidates")
+    and not (
+        line.startswith("a=fingerprint:")
+        and not line.startswith("a=fingerprint:sha-256")
+    )
+]
+sdp_to_send = "\r\n".join(sdp_lines) + "\r\n"
+```
+This should produce a ~480 byte SDP matching what a browser sends. **Not yet confirmed
+working** — test was in flight at compact time.
+
+**Previous failure mode (before the 413 was fixed):**
+When a 200 response was received from the server, ICE negotiation completed successfully
+(`ICE completed` in the aioice logs), but the WebRTC data channel never opened
+(`WebRTC channel did not open within 15s`). The connection state went directly
+`new → closed` (from our own `pc.close()` in the finally block) — it never reached
+`connecting`, meaning DTLS never started.
+
+### What to do after compact
+
+1. **Check if the 413 is fixed:** Run `journalctl -u pinging-monitor -f` on CT 113
+   (`192.168.4.188`). Look for `WebRTC SDP offer (NNN bytes, 0 candidate lines)` — NNN
+   should be ~480. If still 413, the new code wasn't pulled; run:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main/app.py \
+     -o /opt/pinging-monitor/app.py && systemctl restart pinging-monitor
+   ```
+
+2. **If 413 is gone but channel still doesn't open:** The server response is now logged
+   (`WebRTC server response: {...}`). Paste it here. Key things to check in the response:
+   - `answer.sdp` — look for `a=setup:` (active = server initiates DTLS, passive = we initiate)
+   - `candidate` — the ICE candidate the server sends back
+   The DTLS not starting suggests either a role mismatch (server expects us to initiate but
+   aiortc is waiting for server) or the server can't reach us (no candidates in our offer
+   means server doesn't know our address until it sees our STUN binding requests).
+
+3. **If DTLS is the remaining issue:** Consider patching the SDP to force
+   `a=setup:active` (making aiortc initiate DTLS to the server):
+   ```python
+   sdp_to_send = sdp_to_send.replace("a=setup:actpass", "a=setup:active")
+   ```
+   This makes aiortc the DTLS client, initiating to the server after ICE — the server
+   doesn't need to know our address to start DTLS.
+
+4. **If WebRTC simply won't work with aiortc:** Set `WEBRTC_ENABLED=false` in the
+   systemd service. HTTP and DNS tests are fully working and give good monitoring coverage.
+   WebRTC can be revisited when submitting to community-scripts.
