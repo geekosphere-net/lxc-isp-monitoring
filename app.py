@@ -61,6 +61,47 @@ try:
 except Exception as _e:
     logger.warning("Could not patch DTLS cipher list: %s", _e)
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: tolerate the pinging.net server certificate's zero serial
+# number.  The webrtc-unreliable Rust crate generates certs with serial=0,
+# which is invalid per RFC 5280.  cryptography 42+ raises ValueError when
+# loading such a cert; older versions emit a DeprecationWarning.  Either way
+# the failure happens inside aiortc's DTLS fingerprint-verification step,
+# causing an immediate connection failure after the handshake succeeds.
+#
+# We patch OpenSSL.crypto.X509.to_cryptography() — the method aiortc calls
+# to get the peer cert as a cryptography object for fingerprint checking —
+# to suppress the exception and return a usable object.
+# ---------------------------------------------------------------------------
+try:
+    import warnings as _warnings
+    from OpenSSL import crypto as _crypto
+
+    _orig_to_cryptography = _crypto.X509.to_cryptography
+
+    def _patched_to_cryptography(self):  # type: ignore[no-untyped-def]
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings("ignore", category=DeprecationWarning)
+            _warnings.filterwarnings("ignore", category=UserWarning)
+            try:
+                return _orig_to_cryptography(self)
+            except Exception:
+                # Fall back: load raw DER bytes via a relaxed backend path so
+                # aiortc can still compute the SHA-256 fingerprint.
+                from cryptography.hazmat.primitives.serialization import Encoding
+                from cryptography.x509 import load_der_x509_certificate
+                from cryptography.hazmat.backends import default_backend
+                der = _crypto.dump_certificate(_crypto.FILETYPE_ASN1, self)
+                return load_der_x509_certificate(der, default_backend())
+
+    _crypto.X509.to_cryptography = _patched_to_cryptography  # type: ignore[method-assign]
+    logger.info("Patched OpenSSL X509.to_cryptography to tolerate zero serial number")
+except Exception as _e:
+    logger.warning("Could not patch X509.to_cryptography: %s", _e)
+
+# Temporarily re-enable aiortc DEBUG logging to see the cert/fingerprint step
+logging.getLogger("aiortc").setLevel(logging.DEBUG)
+
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/monitor.db"))
 TARGET_HOST = os.environ.get("TARGET_HOST", "https://pinging.net")
 PING_INTERVAL = float(os.environ.get("PING_INTERVAL", "1.0"))
