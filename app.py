@@ -28,6 +28,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+# Surface the DTLS error that aiortc swallows silently at DEBUG level
+logging.getLogger("aiortc").setLevel(logging.DEBUG)
+logging.getLogger("dtls").setLevel(logging.DEBUG)
 
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/monitor.db"))
 TARGET_HOST = os.environ.get("TARGET_HOST", "https://pinging.net")
