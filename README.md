@@ -30,24 +30,34 @@ dashboard/
   index.js
 proxmox/
   pinging-monitor.json               # Community-Scripts app manifest
-  ct/pinging-monitor.sh              # Proxmox helper — container creation + update_script
-  install/pinging-monitor-install.sh # Runs inside the LXC during first install
+  ct/pinging-monitor.sh              # community-scripts conformant ct entry-point
+  install/pinging-monitor-install.sh # community-scripts conformant install script
+  testing/                           # ⚠ DELETE before submitting PR to community-scripts
+    deploy.sh                        # Standalone deploy script for testing from this repo
 ```
 
 ---
 
 ## Quick Install (Proxmox)
 
-From the Proxmox shell, run the community-scripts helper:
+From the Proxmox host shell:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main/proxmox/ct/pinging-monitor.sh)"
+bash <(curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main/proxmox/testing/deploy.sh)
 ```
 
 This creates a Debian 13 LXC with 1 CPU / 512 MB RAM / 4 GB disk, installs the monitor, and starts it automatically.
 
 **Dashboard:** `http://<lxc-ip>:8080`  
 **Logs:** `journalctl -u pinging-monitor -f` (inside the LXC)
+
+### Overriding defaults
+
+```bash
+CT_ID=120 CT_STORAGE=local-zfs CT_BRIDGE=vmbr1 bash <(curl -fsSL ...)
+```
+
+Available environment variables: `CT_ID`, `CT_HOSTNAME`, `CT_STORAGE`, `CT_TMPL_STORAGE`, `CT_DISK`, `CT_RAM`, `CT_CPU`, `CT_BRIDGE`, `CT_OS`, `CT_VERSION`.
 
 ---
 
