@@ -60,6 +60,22 @@ function update_script() {
 
 start
 build_container
+
+# build.func hardcodes the install script URL to the community-scripts/ProxmoxVE
+# repo. Since this script lives in a standalone repo that hasn't been merged
+# there, build_container silently 404s on the install step. Run our install
+# script directly inside the container via pct exec.
+msg_info "Installing ${APP}"
+pct exec "$CTID" -- bash -c '
+  FUNCTIONS_FILE_PATH=$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/install.func)
+  export FUNCTIONS_FILE_PATH
+  curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main/proxmox/install/pinging-monitor-install.sh \
+    -o /tmp/pinging-install.sh
+  bash /tmp/pinging-install.sh
+  rm -f /tmp/pinging-install.sh
+'
+msg_ok "Installed ${APP}"
+
 description
 
 msg_ok "Completed successfully!\n"
