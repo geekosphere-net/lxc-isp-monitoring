@@ -34,6 +34,7 @@ TARGET_HOST = os.environ.get("TARGET_HOST", "https://pinging.net")
 PING_INTERVAL = float(os.environ.get("PING_INTERVAL", "1.0"))
 DNS_INTERVAL = float(os.environ.get("DNS_INTERVAL", "30.0"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
+WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "false", "no")
 
 # Shared counters passed to the server during WebRTC session negotiation
 # (mirrors what the browser frontend does)
@@ -171,6 +172,10 @@ async def _webrtc_session() -> None:
     channel_open = asyncio.Event()
     message_queue: asyncio.Queue[str] = asyncio.Queue()
 
+    @pc.on("connectionstatechange")
+    async def on_connection_state_change() -> None:
+        logger.info("WebRTC connection state → %s", pc.connectionState)
+
     @channel.on("open")
     def on_open() -> None:
         logger.info("WebRTC data channel open")
@@ -282,6 +287,9 @@ async def prune_loop() -> None:
 
 
 async def webrtc_ping_loop() -> None:
+    if not WEBRTC_ENABLED:
+        logger.info("WebRTC loop disabled (WEBRTC_ENABLED=false)")
+        return
     if not WEBRTC_AVAILABLE:
         logger.info("WebRTC loop skipped (aiortc not available)")
         return

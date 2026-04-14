@@ -87,6 +87,7 @@ systemctl daemon-reload && systemctl restart pinging-monitor
 | `PING_INTERVAL` | `1.0` | Seconds between HTTP/WebRTC pings |
 | `DNS_INTERVAL` | `30.0` | Seconds between DNS checks |
 | `RETENTION_DAYS` | `30` | Days of history to keep (older rows pruned hourly) |
+| `WEBRTC_ENABLED` | `true` | Set to `false` to disable WebRTC pings (HTTP + DNS still run) |
 
 > **Note:** WebRTC pings require outbound UDP to `pinging.net:8888`. If your network blocks UDP egress, HTTP and DNS tests still run.
 

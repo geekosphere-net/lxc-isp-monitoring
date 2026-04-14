@@ -88,6 +88,7 @@ All options are environment variables set in the systemd service unit (`/etc/sys
 | `PING_INTERVAL` | `1.0` | Seconds between HTTP/WebRTC pings |
 | `DNS_INTERVAL` | `30.0` | Seconds between DNS checks |
 | `RETENTION_DAYS` | `30` | Days of history to retain |
+| `WEBRTC_ENABLED` | `true` | Set to `false` to disable WebRTC pings (HTTP + DNS still run) |
 
 After editing the unit file, reload with:
 ```bash
