@@ -99,6 +99,30 @@ try:
 except Exception as _e:
     logger.warning("Could not patch X509.to_cryptography: %s", _e)
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: skip aiortc's unconditional SRTP profile requirement.
+#
+# aiortc requires an SRTP profile to be negotiated in the DTLS handshake,
+# even for pure data-channel (SCTP) connections where SRTP is irrelevant.
+# pinging.net's webrtc-unreliable server is data-channel-only and never
+# responds to the use_srtp DTLS extension, so get_selected_srtp_profile()
+# returns None and aiortc fails with "no SRTP profile negotiated".
+#
+# Returning a dummy profile lets aiortc's check pass.  The SRTP keying
+# material aiortc derives afterwards is never used for SCTP data channels.
+# ---------------------------------------------------------------------------
+try:
+    _orig_get_srtp_profile = _SSL.Connection.get_selected_srtp_profile
+
+    def _patched_get_srtp_profile(self) -> str:
+        result = _orig_get_srtp_profile(self)
+        return result if result is not None else "SRTP_AES128_CM_SHA1_80"
+
+    _SSL.Connection.get_selected_srtp_profile = _patched_get_srtp_profile  # type: ignore[method-assign]
+    logger.info("Patched SSL.Connection.get_selected_srtp_profile for data-channel-only server")
+except Exception as _e:
+    logger.warning("Could not patch get_selected_srtp_profile: %s", _e)
+
 # Temporarily re-enable aiortc DEBUG logging to see the cert/fingerprint step
 logging.getLogger("aiortc").setLevel(logging.DEBUG)
 
