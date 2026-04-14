@@ -21,16 +21,14 @@ set -euo pipefail
 # Config — override via environment variables if needed
 # -----------------------------------------------------------------------------
 APP="Pinging Monitor"
-REPO_RAW="https://raw.githubusercontent.com/geekosphere-net/lxc-isp-monitoring/main"
-INSTALL_SCRIPT_URL="${REPO_RAW}/proxmox/install/pinging-monitor-install.sh"
-INSTALL_FUNC_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/install.func"
+REPO_URL="https://github.com/geekosphere-net/lxc-isp-monitoring.git"
 
-CT_ID="${CT_ID:-}"                        # leave blank to auto-select next free ID
+CT_ID="${CT_ID:-}"                           # leave blank to auto-select next free ID
 CT_HOSTNAME="${CT_HOSTNAME:-pinging}"
-CT_STORAGE="${CT_STORAGE:-local-thin}"    # storage for container rootfs
+CT_STORAGE="${CT_STORAGE:-local-thin}"       # storage for container rootfs
 CT_TMPL_STORAGE="${CT_TMPL_STORAGE:-local}"  # storage for template download
-CT_DISK="${CT_DISK:-4}"                   # GB
-CT_RAM="${CT_RAM:-512}"                   # MB
+CT_DISK="${CT_DISK:-4}"                      # GB
+CT_RAM="${CT_RAM:-512}"                      # MB
 CT_CPU="${CT_CPU:-1}"
 CT_BRIDGE="${CT_BRIDGE:-vmbr0}"
 CT_OS="${CT_OS:-debian}"
@@ -85,9 +83,6 @@ if [[ -z "$TMPL" ]]; then
   fi
   pveam download "$CT_TMPL_STORAGE" "$TMPL_NAME" &>/dev/null
   TMPL="${CT_TMPL_STORAGE}:vztmpl/${TMPL_NAME}"
-else
-  # pveam list returns "<storage>:vztmpl/<name>" already
-  :
 fi
 msg_ok "Template: ${TMPL}"
 
@@ -114,7 +109,7 @@ msg_ok "Created LXC container ${CT_ID}"
 # -----------------------------------------------------------------------------
 msg_info "Starting container"
 pct start "$CT_ID"
-sleep 5   # give the container a moment to come up and get an IP
+sleep 5
 msg_ok "Container started"
 
 # -----------------------------------------------------------------------------
@@ -133,21 +128,89 @@ done
 msg_ok "Network reachable"
 
 # -----------------------------------------------------------------------------
-# Run install script inside the container
+# Write self-contained install script to host temp file, push into container,
+# then execute it. This avoids all bash -c quoting/escaping issues and ensures
+# pct exec sees the real exit code.
 # -----------------------------------------------------------------------------
-msg_info "Installing curl in container"
-pct exec "$CT_ID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
-msg_ok "curl installed"
+msg_info "Preparing install script"
+TMPSCRIPT=$(mktemp /tmp/pinging-ct-install-XXXXXX.sh)
 
-msg_info "Running install script"
-pct exec "$CT_ID" -- bash -c "
-  set -euo pipefail
-  FUNCTIONS_FILE_PATH=\$(curl -fsSL ${INSTALL_FUNC_URL})
-  export FUNCTIONS_FILE_PATH
-  curl -fsSL ${INSTALL_SCRIPT_URL} -o /tmp/pinging-install.sh
-  bash /tmp/pinging-install.sh
-  rm -f /tmp/pinging-install.sh
-" && msg_ok "Install complete" || msg_error "Install script failed — check output above"
+cat > "$TMPSCRIPT" << 'INSTALL_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR=/opt/pinging-monitor
+DATA_DIR=/var/lib/pinging-monitor
+REPO_URL=https://github.com/geekosphere-net/lxc-isp-monitoring.git
+
+echo "--- Installing system dependencies"
+apt-get update -qq
+apt-get install -y -q \
+    python3 python3-pip python3-venv \
+    build-essential libssl-dev libffi-dev \
+    ca-certificates curl git
+
+echo "--- Creating directories"
+mkdir -p "$DATA_DIR" "$INSTALL_DIR/dashboard"
+
+echo "--- Cloning repository"
+git clone --depth 1 "$REPO_URL" /tmp/pinging-src
+
+echo "--- Copying application files"
+cp /tmp/pinging-src/app.py "$INSTALL_DIR/"
+cp -r /tmp/pinging-src/dashboard/. "$INSTALL_DIR/dashboard/"
+cp /tmp/pinging-src/requirements.txt "$INSTALL_DIR/"
+git -C /tmp/pinging-src rev-parse --short HEAD 2>/dev/null \
+    > "$INSTALL_DIR/version" || echo "unknown" > "$INSTALL_DIR/version"
+rm -rf /tmp/pinging-src
+
+echo "--- Creating Python virtual environment"
+python3 -m venv "$INSTALL_DIR/.venv"
+"$INSTALL_DIR/.venv/bin/pip" install --upgrade pip --quiet
+echo "--- Installing Python packages (aiortc build may take a few minutes)"
+"$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
+
+echo "--- Creating systemd service"
+cat > /etc/systemd/system/pinging-monitor.service << 'UNIT'
+[Unit]
+Description=Pinging Monitor — ISP connectivity daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+WorkingDirectory=/opt/pinging-monitor
+Environment="DB_PATH=/var/lib/pinging-monitor/monitor.db"
+Environment="TARGET_HOST=https://pinging.net"
+Environment="RETENTION_DAYS=30"
+ExecStart=/opt/pinging-monitor/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now pinging-monitor
+echo "--- Install complete"
+INSTALL_EOF
+
+msg_ok "Install script prepared"
+
+# Push script into container and run it
+msg_info "Running install inside container (aiortc build may take a few minutes)"
+pct push "$CT_ID" "$TMPSCRIPT" /tmp/pinging-install.sh --perms 0755
+rm -f "$TMPSCRIPT"
+
+pct exec "$CT_ID" -- bash /tmp/pinging-install.sh \
+  && msg_ok "Install complete" \
+  || msg_error "Install failed — scroll up for details"
+
+pct exec "$CT_ID" -- rm -f /tmp/pinging-install.sh
 
 # -----------------------------------------------------------------------------
 # Done
@@ -158,5 +221,4 @@ msg_ok "Completed successfully!"
 echo -e "\n  ${GN}${APP} is ready.${CL}"
 echo -e "  ${YW}Dashboard:${CL}  ${BGN}http://${IP}:8080${CL}"
 echo -e "  ${YW}Logs:${CL}       journalctl -u pinging-monitor -f  (inside CT ${CT_ID})"
-echo -e "  ${YW}Update:${CL}     re-run this script against the same CT_ID, or use"
-echo -e "              the community-scripts update flow once merged.\n"
+echo -e "  ${YW}Update:${CL}     re-run this script with CT_ID=${CT_ID} to update in place.\n"
