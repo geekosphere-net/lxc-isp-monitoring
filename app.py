@@ -190,15 +190,24 @@ async def _webrtc_session() -> None:
         logger.info("WebRTC data channel closed")
 
     try:
-        # Build SDP offer. We need at least one local host candidate in the SDP
-        # so the server knows our address and can initiate DTLS back to us.
-        # Waiting for full ICE gathering bloats the SDP with STUN/TURN
-        # server-reflexive candidates and causes a 413 from pinging.net.
-        # A short sleep lets the local host candidate be gathered (takes <100ms)
-        # without collecting expensive reflexive candidates.
+        # Build SDP offer. We need at least one local host candidate so the
+        # server knows our address and can initiate DTLS back to us.
+        # Waiting for full ICE gathering includes server-reflexive (STUN)
+        # candidates that bloat the SDP and cause 413s from pinging.net.
+        # Solution: wait for gathering to complete then strip everything
+        # except host candidates — small payload, server still gets our IP.
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
-        await asyncio.sleep(0.5)
+
+        deadline = time.monotonic() + 5.0
+        while pc.iceGatheringState != "complete" and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+
+        # Keep only host candidates; drop srflx/relay lines
+        filtered_sdp = "\r\n".join(
+            line for line in pc.localDescription.sdp.splitlines()
+            if not (line.startswith("a=candidate:") and " typ host " not in line)
+        ) + "\r\n"
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -207,7 +216,7 @@ async def _webrtc_session() -> None:
                     "num_successful": _num_successful,
                     "num_timeout": _num_timeout,
                 },
-                content=pc.localDescription.sdp.encode(),
+                content=filtered_sdp.encode(),
                 headers={"content-type": "application/sdp"},
             )
             resp.raise_for_status()
