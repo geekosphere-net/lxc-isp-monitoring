@@ -341,6 +341,7 @@ async def api_stats(hours: int = 24) -> dict:
     cutoff = int((time.time() - hours * 3600) * 1000)
     stats: dict = {}
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         for type_ in ("http", "webrtc", "dns"):
             async with db.execute(
                 """
