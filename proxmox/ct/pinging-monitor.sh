@@ -43,9 +43,9 @@ function update_script() {
 
   msg_info "Updating ${APP}"
   git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git /tmp/pinging-src &>/dev/null
-  cp -r /tmp/pinging-src/app.py /opt/pinging-monitor/
-  cp -r /tmp/pinging-src/dashboard /opt/pinging-monitor/
-  cp /tmp/pinging-src/requirements.txt /opt/pinging-monitor/
+  cp /tmp/pinging-src/app.py /opt/pinging-monitor/app.py
+  cp -r /tmp/pinging-src/dashboard/. /opt/pinging-monitor/dashboard/
+  cp /tmp/pinging-src/requirements.txt /opt/pinging-monitor/requirements.txt
   rm -rf /tmp/pinging-src
   /opt/pinging-monitor/.venv/bin/pip install -q -r /opt/pinging-monitor/requirements.txt
   echo "$LATEST_HASH" >/opt/pinging-monitor/version
