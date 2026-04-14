@@ -22,6 +22,7 @@ apt-get install -y -q \
 echo "==> Creating directories..."
 mkdir -p "$DATA_DIR"
 mkdir -p "$INSTALL_DIR"
+chown nobody:nogroup "$DATA_DIR"
 
 echo "==> Copying monitor files to $INSTALL_DIR..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

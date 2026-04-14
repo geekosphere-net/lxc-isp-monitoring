@@ -152,6 +152,7 @@ apt-get install -y -q \
 
 echo "--- Creating directories"
 mkdir -p "$DATA_DIR" "$INSTALL_DIR/dashboard"
+chown nobody:nogroup "$DATA_DIR"
 
 echo "--- Cloning repository"
 git clone --depth 1 "$REPO_URL" /tmp/pinging-src

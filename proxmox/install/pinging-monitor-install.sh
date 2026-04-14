@@ -27,6 +27,7 @@ msg_ok "Installed Dependencies"
 
 msg_info "Installing ${APP}"
 mkdir -p /opt/pinging-monitor /var/lib/pinging-monitor
+chown nobody:nogroup /var/lib/pinging-monitor
 
 $STD git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git /tmp/pinging-src
 cp -r /tmp/pinging-src/app.py /opt/pinging-monitor/
