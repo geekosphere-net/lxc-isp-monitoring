@@ -1,0 +1,44 @@
+{
+  "name": "Pinging Monitor",
+  "slug": "pinging-monitor",
+  "categories": [
+    9
+  ],
+  "date_created": "2026-04-14",
+  "type": "ct",
+  "updateable": true,
+  "privileged": false,
+  "interface_port": 8080,
+  "documentation": "https://github.com/geekosphere-net/lxc-isp-monitoring",
+  "website": "https://pinging.net/",
+  "logo": "https://cdn.jsdelivr.net/gh/selfhst/icons@main/webp/pinging-net.webp",
+  "config_path": "/etc/systemd/system/pinging-monitor.service",
+  "description": "24/7 ISP uptime monitor using HTTP, WebRTC UDP, and DNS tests against pinging.net. Serves a local dashboard showing RTT, packet loss, and outage history.",
+  "install_methods": [
+    {
+      "type": "default",
+      "script": "ct/pinging-monitor.sh",
+      "resources": {
+        "cpu": 1,
+        "ram": 512,
+        "hdd": 4,
+        "os": "Debian",
+        "version": "13"
+      }
+    }
+  ],
+  "default_credentials": {
+    "username": null,
+    "password": null
+  },
+  "notes": [
+    {
+      "text": "WebRTC pings require outbound UDP to pinging.net:8888. If blocked by your network, HTTP pings still run.",
+      "type": "info"
+    },
+    {
+      "text": "Data is stored at /var/lib/pinging-monitor/monitor.db. To change the target server set TARGET_HOST in the systemd service.",
+      "type": "info"
+    }
+  ]
+}

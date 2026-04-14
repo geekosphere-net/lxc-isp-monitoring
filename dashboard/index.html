@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ISP Monitor</title>
+  <link rel="stylesheet" href="index.css">
+</head>
+<body>
+  <header>
+    <h1>ISP Monitor</h1>
+    <span id="last-updated">Loading…</span>
+  </header>
+
+  <main>
+    <!-- Current status -->
+    <section class="status-cards">
+      <div class="card" id="card-http">
+        <div class="card-dot"></div>
+        <div class="card-body">
+          <div class="card-label">HTTP</div>
+          <div class="card-rtt">— ms</div>
+        </div>
+      </div>
+      <div class="card" id="card-webrtc">
+        <div class="card-dot"></div>
+        <div class="card-body">
+          <div class="card-label">WebRTC</div>
+          <div class="card-rtt">— ms</div>
+        </div>
+      </div>
+      <div class="card" id="card-dns">
+        <div class="card-dot"></div>
+        <div class="card-body">
+          <div class="card-label">DNS</div>
+          <div class="card-rtt">— ms</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Stats with time window selector -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Statistics</h2>
+        <div class="window-btns">
+          <button class="win-btn active" data-hours="1">1h</button>
+          <button class="win-btn" data-hours="24">24h</button>
+          <button class="win-btn" data-hours="168">7d</button>
+        </div>
+      </div>
+      <div id="stats-grid"></div>
+    </section>
+
+    <!-- 24h timeline -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>24h Timeline</h2>
+        <span class="panel-subtitle">1 cell = 1 minute · HTTP &amp; WebRTC combined</span>
+      </div>
+      <div class="legend">
+        <span class="leg good">Good (&lt;10% loss)</span>
+        <span class="leg degraded">Degraded (10–49%)</span>
+        <span class="leg down">Down (≥50%)</span>
+        <span class="leg nodata">No data</span>
+      </div>
+      <div id="timeline"></div>
+    </section>
+
+    <!-- Outages -->
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Recent Outages</h2>
+        <span class="panel-subtitle">last 7 days · gaps &gt; 5 s with no successful ping</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Start</th><th>End</th><th>Duration</th></tr></thead>
+          <tbody id="outages-body">
+            <tr><td colspan="3" class="empty">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="index.js"></script>
+</body>
+</html>
