@@ -190,12 +190,15 @@ async def _webrtc_session() -> None:
         logger.info("WebRTC data channel closed")
 
     try:
-        # Build and send SDP offer using trickle ICE — send the initial offer
-        # immediately before ICE gathering completes, matching what the browser
-        # frontend does. Waiting for full ICE gathering bloats the SDP with all
-        # gathered candidates, causing a 413 from pinging.net's server.
+        # Build SDP offer. We need at least one local host candidate in the SDP
+        # so the server knows our address and can initiate DTLS back to us.
+        # Waiting for full ICE gathering bloats the SDP with STUN/TURN
+        # server-reflexive candidates and causes a 413 from pinging.net.
+        # A short sleep lets the local host candidate be gathered (takes <100ms)
+        # without collecting expensive reflexive candidates.
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
+        await asyncio.sleep(0.5)
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -204,7 +207,7 @@ async def _webrtc_session() -> None:
                     "num_successful": _num_successful,
                     "num_timeout": _num_timeout,
                 },
-                content=offer.sdp.encode(),
+                content=pc.localDescription.sdp.encode(),
                 headers={"content-type": "application/sdp"},
             )
             resp.raise_for_status()
