@@ -202,9 +202,15 @@ async def _webrtc_session() -> None:
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
+        # aiortc eagerly gathers ICE candidates inside createOffer(), so
+        # offer.sdp already contains host + srflx candidates and sha-384/512
+        # fingerprints that browsers never send. Strip them all down to match
+        # what a browser sends: no candidates, sha-256 fingerprint only.
         sdp_lines = [
             line for line in offer.sdp.splitlines()
-            if not (
+            if not line.startswith("a=candidate:")
+            and not line.startswith("a=end-of-candidates")
+            and not (
                 line.startswith("a=fingerprint:")
                 and not line.startswith("a=fingerprint:sha-256")
             )
