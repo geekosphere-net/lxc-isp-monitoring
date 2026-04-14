@@ -194,12 +194,22 @@ async def _webrtc_session() -> None:
         logger.info("WebRTC data channel closed")
 
     try:
-        # Mirror the browser frontend exactly: send localDescription.sdp
-        # immediately after setLocalDescription, no waiting, no filtering.
+        # Mirror the browser frontend: send the initial offer SDP with no
+        # candidates (browser sends immediately before ICE gathering).
+        # Also strip aiortc's extra sha-384/sha-512 fingerprints — browsers
+        # only include sha-256, and the extras push the payload over
+        # pinging.net's server limit causing a 413.
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
-        sdp_to_send = pc.localDescription.sdp
+        sdp_lines = [
+            line for line in offer.sdp.splitlines()
+            if not (
+                line.startswith("a=fingerprint:")
+                and not line.startswith("a=fingerprint:sha-256")
+            )
+        ]
+        sdp_to_send = "\r\n".join(sdp_lines) + "\r\n"
         logger.info(
             "WebRTC SDP offer (%d bytes, %d candidate lines):\n%s",
             len(sdp_to_send),
