@@ -136,6 +136,36 @@ This repo follows the [Proxmox Community-Scripts](https://community-scripts.org)
 
 ---
 
+## WebRTC Implementation Notes
+
+The original [pinging.net](https://pinging.net) client is a browser — it uses the browser's native WebRTC stack. This project replicates that with [aiortc](https://github.com/aiortc/aiortc), a Python WebRTC library. The pinging.net server uses [webrtc-unreliable](https://github.com/kyren/webrtc-unreliable) v0.6, a Rust crate that is data-channel-only and non-standard in several ways. Getting aiortc to work against it required four workarounds, all applied as monkey-patches at startup in `app.py`:
+
+### 1 — SDP size limit (413 Payload Too Large)
+
+**Problem:** aiortc eagerly gathers ICE candidates inside `createOffer()` and includes three DTLS fingerprint algorithms (sha-256/384/512), producing an SDP offer of ~1 kB. pinging.net's `/new_rtc_session` endpoint rejects payloads over ~500 bytes.
+
+**Fix (in `_webrtc_session()`):** Strip all `a=candidate:` and `a=end-of-candidates` lines and all non-sha-256 `a=fingerprint:` lines before sending. Also replace `a=setup:actpass` with `a=setup:active` to ensure aiortc initiates the DTLS handshake (the server always responds with `a=setup:passive`). The stripped SDP is ~410 bytes, matching what a browser sends.
+
+### 2 — Cipher suite mismatch (empty DTLS handshake failure)
+
+**Problem:** aiortc configures its DTLS SSL context with ECDHE-ECDSA-only cipher suites. The pinging.net server presents an RSA certificate. A server with an RSA cert cannot negotiate any ECDSA cipher suite, so it sends a bare `handshake_failure` alert immediately — aiortc reports this as `DTLS handshake failed (error )` with an empty error string.
+
+**Fix:** Monkey-patch `OpenSSL.SSL.Context.set_cipher_list` so that whenever aiortc sets an ECDSA-only list, the RSA equivalents (replacing `ECDSA` with `RSA` in each suite name) are appended automatically. Browsers work because they offer both families; this patch makes aiortc do the same.
+
+### 3 — Zero serial number certificate (cryptography 42+ rejects server cert)
+
+**Problem:** The webrtc-unreliable Rust crate generates self-signed DTLS certificates with `serial=0`, which is invalid per RFC 5280. `cryptography` 42+ raises a `ValueError` when loading such a certificate. This happens inside aiortc's DTLS fingerprint-verification step (`OpenSSL.crypto.X509.to_cryptography()`), causing the connection to fail immediately after a successful handshake.
+
+**Fix:** Monkey-patch `OpenSSL.crypto.X509.to_cryptography` to catch the exception and fall back to loading the certificate from raw DER bytes via `cryptography.x509.load_der_x509_certificate()`, which bypasses the serial-number validation. Fingerprint verification still succeeds because the DER bytes are intact.
+
+### 4 — Missing SRTP profile (data-channel-only server)
+
+**Problem:** aiortc unconditionally calls `_setup_srtp()` after every DTLS handshake and raises `"DTLS handshake failed (no SRTP profile negotiated)"` if the peer didn't negotiate an SRTP profile via the `use_srtp` DTLS extension. webrtc-unreliable is a pure data-channel server and never sends `use_srtp`, so this check always fails.
+
+**Fix:** Monkey-patch `RTCDtlsTransport._setup_srtp` to return immediately without doing anything. The SRTP keying material it would derive is only used for audio/video media tracks; an SCTP data channel runs directly over the DTLS record layer and never touches SRTP.
+
+---
+
 ## Credits
 
 - [pinging.net](https://pinging.net) / [benhansen-io/pinging](https://github.com/benhansen-io/pinging) — the upstream connectivity testing service this monitor targets
