@@ -176,6 +176,10 @@ async def _webrtc_session() -> None:
     async def on_connection_state_change() -> None:
         logger.info("WebRTC connection state → %s", pc.connectionState)
 
+    @pc.on("iceconnectionstatechange")
+    async def on_ice_connection_state_change() -> None:
+        logger.info("WebRTC ICE state → %s", pc.iceConnectionState)
+
     @channel.on("open")
     def on_open() -> None:
         logger.info("WebRTC data channel open")
@@ -190,24 +194,18 @@ async def _webrtc_session() -> None:
         logger.info("WebRTC data channel closed")
 
     try:
-        # Build SDP offer. We need at least one local host candidate so the
-        # server knows our address and can initiate DTLS back to us.
-        # Waiting for full ICE gathering includes server-reflexive (STUN)
-        # candidates that bloat the SDP and cause 413s from pinging.net.
-        # Solution: wait for gathering to complete then strip everything
-        # except host candidates — small payload, server still gets our IP.
+        # Mirror the browser frontend exactly: send localDescription.sdp
+        # immediately after setLocalDescription, no waiting, no filtering.
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
 
-        deadline = time.monotonic() + 5.0
-        while pc.iceGatheringState != "complete" and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
-
-        # Keep only host candidates; drop srflx/relay lines
-        filtered_sdp = "\r\n".join(
-            line for line in pc.localDescription.sdp.splitlines()
-            if not (line.startswith("a=candidate:") and " typ host " not in line)
-        ) + "\r\n"
+        sdp_to_send = pc.localDescription.sdp
+        logger.info(
+            "WebRTC SDP offer (%d bytes, %d candidate lines):\n%s",
+            len(sdp_to_send),
+            sum(1 for l in sdp_to_send.splitlines() if l.startswith("a=candidate:")),
+            sdp_to_send,
+        )
 
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -216,11 +214,13 @@ async def _webrtc_session() -> None:
                     "num_successful": _num_successful,
                     "num_timeout": _num_timeout,
                 },
-                content=filtered_sdp.encode(),
+                content=sdp_to_send.encode(),
                 headers={"content-type": "application/sdp"},
             )
             resp.raise_for_status()
             server_response = resp.json()
+
+        logger.info("WebRTC server response: %s", server_response)
 
         answer = RTCSessionDescription(
             sdp=server_response["answer"]["sdp"],
