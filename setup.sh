@@ -26,7 +26,9 @@ chown nobody:nogroup "$DATA_DIR"
 
 echo "==> Copying monitor files to $INSTALL_DIR..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp -r "$SCRIPT_DIR"/* "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/app.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/dashboard" "$INSTALL_DIR/"
 
 echo "==> Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/.venv"

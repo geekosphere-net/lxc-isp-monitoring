@@ -263,8 +263,12 @@ async def _webrtc_session() -> None:
     global _num_successful, _num_timeout
 
     pc = RTCPeerConnection()
+    # Use id=0 (pre-negotiated, no DATA_CHANNEL_OPEN handshake) so our channel
+    # lives on SCTP stream 0. pinging.net's server always sends echo replies on
+    # stream 0 regardless of which stream we sent on — if our channel is on
+    # stream 1 (aiortc's default), the replies are silently dropped.
     channel: RTCDataChannel = pc.createDataChannel(
-        "webudp", ordered=False, maxRetransmits=0
+        "webudp", ordered=False, maxRetransmits=0, negotiated=True, id=0
     )
 
     channel_open = asyncio.Event()
@@ -284,7 +288,10 @@ async def _webrtc_session() -> None:
         channel_open.set()
 
     @channel.on("message")
-    def on_message(data: str) -> None:
+    def on_message(data) -> None:
+        logger.debug("WebRTC on_message type=%s: %r", type(data).__name__, data)
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         message_queue.put_nowait(data)
 
     @channel.on("close")
@@ -314,10 +321,6 @@ async def _webrtc_session() -> None:
             )
         ]
         sdp_to_send = "\r\n".join(sdp_lines) + "\r\n"
-        # Force aiortc to be the DTLS initiator — the server always responds with
-        # a=setup:passive, but aiortc doesn't reliably transition from actpass to
-        # active when parsing the answer, causing an immediate connection failure.
-        sdp_to_send = sdp_to_send.replace("a=setup:actpass", "a=setup:active")
         logger.info(
             "WebRTC SDP offer (%d bytes, %d candidate lines):\n%s",
             len(sdp_to_send),
@@ -371,34 +374,76 @@ async def _webrtc_session() -> None:
             await _record("webrtc", False, error="channel open timeout")
             return
 
-        # Ping loop — send timestamp ms, receive echo as last line of response
+        # Ping loop — mirrors browser behavior: send at PING_INTERVAL (1s) regardless
+        # of pending responses, collect echoes asynchronously. The browser fires each
+        # ping's 5-second timeout independently and schedules the next ping immediately;
+        # our previous sequential approach only sent one ping every 6s during stalls,
+        # which may not be enough to trigger server-side routing state.
+        MAX_CONSECUTIVE_TIMEOUTS = 10
         first_ping = True
-        while channel.readyState == "open":
-            ts_ms = int(time.time() * 1000)
-            # Send LOC? on first ping to get server location info in the response
-            msg = f"LOC?\n{ts_ms}" if first_ping else str(ts_ms)
-            first_ping = False
-            t0 = time.monotonic()
-            channel.send(msg)
+        # outstanding: ts_ms_str → monotonic t0 for RTT calculation
+        outstanding: dict[str, float] = {}
 
-            try:
-                response = await asyncio.wait_for(message_queue.get(), timeout=5.0)
-                rtt_ms = (time.monotonic() - t0) * 1000
-                # Last line of response is the echoed timestamp
-                echoed = response.strip().split("\n")[-1]
-                if echoed == str(ts_ms):
-                    _num_successful += 1
-                    await _record("webrtc", True, rtt_ms)
-                    logger.debug("WebRTC ping OK  %.1f ms", rtt_ms)
-                else:
+        async def _send_loop() -> None:
+            nonlocal first_ping
+            while channel.readyState == "open":
+                ts_ms = int(time.time() * 1000)
+                msg = f"LOC?\n{ts_ms}" if first_ping else str(ts_ms)
+                first_ping = False
+                outstanding[str(ts_ms)] = time.monotonic()
+                channel.send(msg)
+                logger.debug("WebRTC send: %r", msg)
+                await asyncio.sleep(PING_INTERVAL)
+
+        async def _recv_loop() -> None:
+            global _num_successful, _num_timeout
+            consecutive_timeouts = 0
+            while channel.readyState == "open":
+                # Wait up to PING_INTERVAL for a response, then fall through to
+                # expire any stale outstanding pings.
+                try:
+                    response = await asyncio.wait_for(
+                        message_queue.get(), timeout=PING_INTERVAL
+                    )
+                    echoed = response.strip().split("\n")[-1]
+                    t0 = outstanding.pop(echoed, None)
+                    if t0 is not None:
+                        rtt_ms = (time.monotonic() - t0) * 1000
+                        consecutive_timeouts = 0
+                        _num_successful += 1
+                        await _record("webrtc", True, rtt_ms)
+                        logger.debug("WebRTC ping OK  %.1f ms", rtt_ms)
+                    else:
+                        logger.info("WebRTC on_message (unmatched): %r", response)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Expire outstanding pings older than 5 seconds
+                now = time.monotonic()
+                for ts_str in [k for k, t0 in list(outstanding.items()) if now - t0 > 5.0]:
+                    outstanding.pop(ts_str, None)
                     _num_timeout += 1
-                    await _record("webrtc", False, error="echo mismatch")
-            except asyncio.TimeoutError:
-                _num_timeout += 1
-                await _record("webrtc", False, error="timeout")
-                logger.debug("WebRTC ping timeout")
+                    await _record("webrtc", False, error="timeout")
+                    consecutive_timeouts += 1
+                    logger.debug(
+                        "WebRTC ping timeout (consecutive=%d/%d)",
+                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS,
+                    )
 
-            await asyncio.sleep(PING_INTERVAL)
+                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                    logger.warning(
+                        "WebRTC session stalled (%d consecutive timeouts) — reconnecting",
+                        consecutive_timeouts,
+                    )
+                    return
+
+        send_task = asyncio.create_task(_send_loop())
+        recv_task = asyncio.create_task(_recv_loop())
+        try:
+            await recv_task  # returns when stalled or channel closes
+        finally:
+            send_task.cancel()
+            await asyncio.gather(send_task, return_exceptions=True)
 
     finally:
         await pc.close()
@@ -427,14 +472,21 @@ async def webrtc_ping_loop() -> None:
     logger.info("WebRTC ping loop starting → %s", TARGET_HOST)
     backoff = 2.0
     while True:
+        ok_before = _num_successful
         try:
             await _webrtc_session()
         except Exception as exc:
             logger.error("WebRTC session error: %s", exc)
             await _record("webrtc", False, error=str(exc)[:200])
+        # Reset backoff if the session produced any successful pings; only
+        # grow it on pure-failure sessions so reconnects stay fast after
+        # transient stalls.
+        if _num_successful > ok_before:
+            backoff = 2.0
+        else:
+            backoff = min(backoff * 2, 60.0)
         logger.info("WebRTC reconnecting in %.0fs", backoff)
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60.0)
 
 
 # ---------------------------------------------------------------------------
