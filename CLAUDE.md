@@ -59,16 +59,26 @@ Results are recorded in a SQLite database (`pings` table).
 API routes:
 - `GET /api/results?minutes=N` — raw ping rows for the last N minutes
 - `GET /api/stats?hours=N` — uptime %, packet loss %, min/avg/max RTT per test type
+- `GET /api/hourly?hours=N` — per-hour avg RTT / uptime / loss for HTTP and WebRTC (default 24 h)
+- `GET /api/daily?days=N` — per-day avg RTT / uptime / loss for HTTP and WebRTC (default 30 days)
 - `GET /api/outages?days=N` — outage events (gaps > 5 s with no successful ping)
 - `/` — static dashboard (mounted last)
 
 ### Dashboard (`dashboard/`)
 
-Vanilla HTML/CSS/JS — no build step. Polls the API every 30 seconds and renders:
-- Status cards (HTTP / WebRTC / DNS) with current RTT
-- Statistics table with 1h / 24h / 7d window selector
-- 24h timeline grid (1 cell = 1 minute)
-- Recent outages table
+Vanilla HTML/CSS/JS — no build step. Two-tab interface:
+
+**Real-Time tab** (default):
+- Status bar — HTTP / WebRTC / DNS dots (green = up, red = down) with latest RTT; 30 s refresh countdown
+- Stats header — Last / Min / Max / Avg / Loss for the active probe (HTTP | WebRTC toggle); updates every 30 s
+- Live grid — 12 rows × 60 cells; each cell = 5 s average of all pings in that window; 1 hour of history; newest row at top; grid re-renders every 1 s from cached data; data fetched every 5 s
+  - Green < 100 ms · Yellow 100–300 ms · Orange > 300 ms · Red ≥ 50% loss · Grey = no data
+  - Hover any cell for a tooltip: time range · avg RTT · loss %
+
+**Historical tab**:
+- Statistics panel — uptime %, avg/min/max RTT, packet loss for HTTP / WebRTC / DNS; 1 h / 24 h / 7 d window selector
+- Latency heatmap — hourly strip (24 cells, last 24 h) + daily calendar grid (week rows × day-of-week columns, last 30 days); HTTP | WebRTC probe toggle applies to both
+- Recent outages — table of gaps > 5 s with no successful ping, last 7 days
 
 ### Proxmox Scripts (`proxmox/`)
 

@@ -95,12 +95,38 @@ systemctl daemon-reload && systemctl restart pinging-monitor
 
 ## Dashboard
 
-The local dashboard (served from `dashboard/`) shows:
+The local dashboard (served from `dashboard/`) is a two-tab interface:
 
-- **Status cards** — live HTTP / WebRTC / DNS state with current RTT
-- **Statistics** — uptime %, packet loss %, min/avg/max RTT across selectable 1h / 24h / 7d windows
-- **24h timeline** — 1 cell per minute, colour-coded: good / degraded / down / no data
-- **Recent outages** — table of gaps > 5 s with no successful ping, last 7 days
+### Real-Time tab
+
+| Element | Detail |
+|---|---|
+| **Status bar** | HTTP / WebRTC / DNS indicator dots — green (up) or red (down) — with latest RTT and a 30 s refresh countdown |
+| **Stats header** | Last · Min · Max · Avg · Loss for the selected probe; HTTP \| WebRTC toggle |
+| **Live grid** | 12 rows × 60 cells — each cell is the 5-second average of all pings in that window, giving 1 hour of history with the newest row at top |
+
+Cell colours follow ITU-T G.1010 thresholds:
+
+| Colour | Meaning |
+|---|---|
+| Green | avg RTT < 100 ms |
+| Yellow | avg RTT 100–300 ms |
+| Orange | avg RTT > 300 ms |
+| Red | ≥ 50 % packet loss |
+| Grey | no data yet |
+
+Hover any cell for an exact tooltip: time range · avg RTT · loss %.
+
+### Historical tab
+
+| Element | Detail |
+|---|---|
+| **Statistics** | Uptime %, avg/min/max RTT, packet loss for all three probe types; selectable 1 h / 24 h / 7 d window |
+| **Hourly heatmap** | 24 cells — one per hour — for the last 24 hours, same RTT colour scale |
+| **Daily calendar** | GitHub-style grid: rows = weeks, columns = Mon–Sun, last 30 days; instantly shows weekly patterns |
+| **Recent outages** | Table of gaps > 5 s with no successful ping, last 7 days |
+
+An HTTP \| WebRTC probe toggle switches both the hourly and daily heatmaps simultaneously.
 
 ---
 
@@ -113,7 +139,17 @@ The local dashboard (served from `dashboard/`) shows:
 3. **`dns_check_loop`** — GETs `https://{rand}dns-check.pinging.net/api/dns-check`, verifies the random number is echoed back
 4. **`prune_loop`** — deletes rows older than `RETENTION_DAYS` once per hour
 
-All results land in a `pings` table in SQLite. The REST API (`/api/results`, `/api/stats`, `/api/outages`) queries this table and the dashboard polls it every 30 seconds.
+All results land in a `pings` table in SQLite. The REST API serves five query endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/results?minutes=N` | Raw ping rows for the last N minutes |
+| `GET /api/stats?hours=N` | Aggregate uptime / RTT / loss per probe type |
+| `GET /api/hourly?hours=N` | Per-hour avg RTT / uptime / loss (default 24 h) |
+| `GET /api/daily?days=N` | Per-day avg RTT / uptime / loss (default 30 days) |
+| `GET /api/outages?days=N` | Outage events (gaps > 5 s, default 7 days) |
+
+The dashboard fetches raw results every 5 s (for the live grid), refreshes the status bar and stats header every 30 s, and loads hourly/daily heatmap data on demand when the Historical tab is opened.
 
 ---
 

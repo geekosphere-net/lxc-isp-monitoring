@@ -9,36 +9,80 @@
 <body>
   <header>
     <h1>ISP Monitor</h1>
-    <span id="last-updated">Loading…</span>
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="realtime">Real-Time</button>
+      <button class="tab-btn" data-tab="history">Historical</button>
+    </nav>
   </header>
 
-  <main>
-    <!-- Current status -->
-    <section class="status-cards">
-      <div class="card" id="card-http">
-        <div class="card-dot"></div>
-        <div class="card-body">
-          <div class="card-label">HTTP</div>
-          <div class="card-rtt">— ms</div>
+  <!-- ── Real-Time Tab ── -->
+  <div id="tab-realtime" class="tab-panel">
+
+    <!-- Status bar: probe health + refresh countdown -->
+    <section class="status-bar">
+      <div class="probe-indicators">
+        <div class="probe-indicator" id="ind-http">
+          <span class="probe-dot"></span>
+          <div class="probe-info">
+            <span class="probe-label">HTTP</span>
+            <span class="probe-rtt">— ms</span>
+          </div>
+        </div>
+        <div class="probe-indicator" id="ind-webrtc">
+          <span class="probe-dot"></span>
+          <div class="probe-info">
+            <span class="probe-label">WebRTC</span>
+            <span class="probe-rtt">— ms</span>
+          </div>
+        </div>
+        <div class="probe-indicator" id="ind-dns">
+          <span class="probe-dot"></span>
+          <div class="probe-info">
+            <span class="probe-label">DNS</span>
+            <span class="probe-rtt">— ms</span>
+          </div>
         </div>
       </div>
-      <div class="card" id="card-webrtc">
-        <div class="card-dot"></div>
-        <div class="card-body">
-          <div class="card-label">WebRTC</div>
-          <div class="card-rtt">— ms</div>
-        </div>
+      <div id="refresh-countdown" class="refresh-countdown">Loading…</div>
+    </section>
+
+    <!-- Stats header: last/min/max/avg/loss for the active probe -->
+    <section class="stats-header">
+      <div class="stats-values">
+        <div class="stat-item"><span class="stat-lbl">Last</span><span class="stat-val" id="sh-last">—</span></div>
+        <div class="stat-sep"></div>
+        <div class="stat-item"><span class="stat-lbl">Min</span><span class="stat-val" id="sh-min">—</span></div>
+        <div class="stat-sep"></div>
+        <div class="stat-item"><span class="stat-lbl">Max</span><span class="stat-val" id="sh-max">—</span></div>
+        <div class="stat-sep"></div>
+        <div class="stat-item"><span class="stat-lbl">Avg</span><span class="stat-val" id="sh-avg">—</span></div>
+        <div class="stat-sep"></div>
+        <div class="stat-item"><span class="stat-lbl">Loss</span><span class="stat-val" id="sh-loss">—</span></div>
       </div>
-      <div class="card" id="card-dns">
-        <div class="card-dot"></div>
-        <div class="card-body">
-          <div class="card-label">DNS</div>
-          <div class="card-rtt">— ms</div>
-        </div>
+      <div class="probe-toggle">
+        <button class="probe-btn active" data-probe="http">HTTP</button>
+        <button class="probe-btn" data-probe="webrtc">WebRTC</button>
       </div>
     </section>
 
-    <!-- Stats with time window selector -->
+    <!-- Second-by-second grid -->
+    <section class="grid-panel">
+      <div class="legend">
+        <span class="leg green">Excellent (&lt;100 ms avg)</span>
+        <span class="leg yellow">Elevated (100–300 ms avg)</span>
+        <span class="leg orange">Poor (&gt;300 ms avg)</span>
+        <span class="leg red">Lost (≥50% failure)</span>
+        <span class="leg nodata">No data</span>
+      </div>
+      <div id="grid"></div>
+    </section>
+
+  </div>
+
+  <!-- ── Historical Tab ── -->
+  <div id="tab-history" class="tab-panel hidden">
+
+    <!-- Aggregate statistics -->
     <section class="panel">
       <div class="panel-header">
         <h2>Statistics</h2>
@@ -51,22 +95,32 @@
       <div id="stats-grid"></div>
     </section>
 
-    <!-- 24h timeline -->
+    <!-- Hourly + Daily latency heatmaps with shared probe toggle -->
     <section class="panel">
       <div class="panel-header">
-        <h2>24h Timeline</h2>
-        <span class="panel-subtitle">1 cell = 1 minute · HTTP &amp; WebRTC combined</span>
+        <h2>Latency Heatmap</h2>
+        <div class="probe-toggle">
+          <button class="hist-probe-btn active" data-probe="http">HTTP</button>
+          <button class="hist-probe-btn" data-probe="webrtc">WebRTC</button>
+        </div>
       </div>
-      <div class="legend">
-        <span class="leg good">Good (&lt;10% loss)</span>
-        <span class="leg degraded">Degraded (10–49%)</span>
-        <span class="leg down">Down (≥50%)</span>
+
+      <div class="hist-legend">
+        <span class="leg green">Excellent (&lt;100 ms avg)</span>
+        <span class="leg yellow">Elevated (100–300 ms avg)</span>
+        <span class="leg orange">Poor (&gt;300 ms avg)</span>
+        <span class="leg red">Lost (≥50% failure)</span>
         <span class="leg nodata">No data</span>
       </div>
-      <div id="timeline"></div>
+
+      <div class="hist-section-label">Hourly — Last 24 Hours</div>
+      <div id="hourly-strip" class="hourly-strip"></div>
+
+      <div class="hist-section-label" style="margin-top: 1.5rem;">Daily — Last 30 Days</div>
+      <div id="daily-calendar"></div>
     </section>
 
-    <!-- Outages -->
+    <!-- Recent outages -->
     <section class="panel">
       <div class="panel-header">
         <h2>Recent Outages</h2>
@@ -81,8 +135,10 @@
         </table>
       </div>
     </section>
-  </main>
 
+  </div>
+
+  <div id="tip" class="tip"></div>
   <script src="index.js"></script>
 </body>
 </html>

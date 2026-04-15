@@ -604,6 +604,58 @@ async def api_outages(days: int = 7) -> list[dict]:
     return outages
 
 
+async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
+    """Aggregate ping stats into fixed-size time buckets (hourly or daily)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT
+              (ts / ?) * ?  AS period_ts,
+              type,
+              COUNT(*)      AS total,
+              SUM(success)  AS ok,
+              AVG(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS avg_rtt,
+              MIN(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS min_rtt,
+              MAX(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS max_rtt
+            FROM pings
+            WHERE ts >= ? AND type IN ('http', 'webrtc')
+            GROUP BY period_ts, type
+            ORDER BY period_ts ASC
+            """,
+            (bucket_ms, bucket_ms, cutoff),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    periods: dict[int, dict] = {}
+    for period_ts, type_, total, ok, avg_rtt, min_rtt, max_rtt in rows:
+        if period_ts not in periods:
+            periods[period_ts] = {"ts": period_ts}
+        periods[period_ts][type_] = {
+            "total": total,
+            "uptime_pct": round(ok / total * 100, 1) if total else None,
+            "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
+            "avg_rtt": round(avg_rtt, 1) if avg_rtt is not None else None,
+            "min_rtt": round(min_rtt, 1) if min_rtt is not None else None,
+            "max_rtt": round(max_rtt, 1) if max_rtt is not None else None,
+        }
+
+    return sorted(periods.values(), key=lambda x: x["ts"])
+
+
+@app.get("/api/hourly")
+async def api_hourly(hours: int = 24) -> list[dict]:
+    """Per-hour RTT/uptime stats for the last N hours (HTTP and WebRTC)."""
+    cutoff = int((time.time() - hours * 3600) * 1000)
+    return await _bucket_stats(cutoff, 3_600_000)
+
+
+@app.get("/api/daily")
+async def api_daily(days: int = 30) -> list[dict]:
+    """Per-day RTT/uptime stats for the last N days (HTTP and WebRTC)."""
+    cutoff = int((time.time() - days * 86400) * 1000)
+    return await _bucket_stats(cutoff, 86_400_000)
+
+
 # Serve the static dashboard — must be mounted last so API routes take precedence
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
 app.mount("/", StaticFiles(directory=str(DASHBOARD_DIR), html=True), name="static")
