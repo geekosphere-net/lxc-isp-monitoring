@@ -20,6 +20,24 @@ let hourlyCache    = null;
 let dailyCache     = null;
 let lastStatusTime = 0;
 let fetching       = false;
+let backendOnline  = null;   // null = unknown (initial), true = online, false = offline
+
+// ── Backend connection badge ──
+function renderConnBadge() {
+  const badge = document.getElementById("conn-badge");
+  if (!badge) return;
+  badge.className = "conn-badge";
+  if (backendOnline === null) {
+    badge.classList.add("conn-unknown");
+    badge.textContent = "Connecting…";
+  } else if (backendOnline) {
+    badge.classList.add("conn-online");
+    badge.textContent = "Online";
+  } else {
+    badge.classList.add("conn-offline");
+    badge.textContent = "Offline";
+  }
+}
 
 // ── API helper ──
 async function fetchJSON(url) {
@@ -176,14 +194,16 @@ setInterval(() => {
   if (el) el.textContent = secs <= 0 ? "Checking…" : `Refreshing in ${secs}s`;
 }, 1000);
 
-// ── Background data fetch (every 2s — keeps cache fresh for the grid) ──
+// ── Background data fetch (every 5s — keeps cache fresh for the grid) ──
 async function fetchData() {
   if (fetching) return;
   fetching = true;
   try {
     resultsCache = await fetchJSON("/api/results?minutes=61");
+    if (backendOnline !== true)  { backendOnline = true;  renderConnBadge(); }
   } catch (e) {
     console.error("Data fetch failed:", e);
+    if (backendOnline !== false) { backendOnline = false; renderConnBadge(); }
   } finally {
     fetching = false;
   }
