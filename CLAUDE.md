@@ -41,7 +41,10 @@ bash setup.sh
 
 This installs dependencies, creates a Python venv at `/opt/pinging-monitor`, writes a systemd service, and starts it. The dashboard is served at `http://<lxc-ip>:8080`.
 
-Logs: `journalctl -u pinging-monitor -f`
+Logs: `journalctl -u pinging-monitor -f`  
+Update: run `update` inside the LXC (installed to `/usr/bin/update` by all install paths)
+
+Install scripts also purge build-only deps (`build-essential`, `libssl-dev`, `libffi-dev`) after the pip compile step to minimise disk use, and write `/etc/systemd/journald.conf.d/00-pinging-monitor.conf` to cap journal size at 50 MB.
 
 ## Architecture
 
@@ -69,6 +72,7 @@ API routes:
 Vanilla HTML/CSS/JS — no build step. Two-tab interface:
 
 **Real-Time tab** (default):
+- Header — connection badge (Online / Offline / Connecting…) reflects whether the browser can reach the FastAPI backend
 - Status bar — HTTP / WebRTC / DNS dots (green = up, red = down) with latest RTT; 30 s refresh countdown
 - Stats header — Last / Min / Max / Avg / Loss for the active probe (HTTP | WebRTC toggle); updates every 30 s
 - Live grid — 12 rows × 60 cells; each cell = 5 s average of all pings in that window; 1 hour of history; newest row at top; grid re-renders every 1 s from cached data; data fetched every 5 s

@@ -49,7 +49,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/geekosphere-net/lxc-isp-moni
 This creates a Debian 13 LXC with 1 CPU / 512 MB RAM / 4 GB disk, installs the monitor, and starts it automatically.
 
 **Dashboard:** `http://<lxc-ip>:8080`  
-**Logs:** `journalctl -u pinging-monitor -f` (inside the LXC)
+**Logs:** `journalctl -u pinging-monitor -f` (inside the LXC)  
+**Update:** exec into the LXC and run `update`
 
 ### Overriding defaults
 
@@ -68,6 +69,8 @@ git clone https://github.com/geekosphere-net/lxc-isp-monitoring.git
 cd lxc-isp-monitoring
 bash setup.sh
 ```
+
+**Update:** run `update` inside the machine.
 
 ---
 
