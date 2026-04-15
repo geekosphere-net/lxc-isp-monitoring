@@ -15,8 +15,6 @@
 # Or after cloning the repo locally:
 #   bash proxmox/testing/deploy.sh
 #
-# To update an existing container:
-#   CT_ID=<id> bash proxmox/testing/deploy.sh
 # =============================================================================
 set -euo pipefail
 
@@ -60,45 +58,6 @@ fi
 echo -e "\n${BL}  ===========================================${CL}"
 echo -e "${BL}       ${APP} — Test Deployment${CL}"
 echo -e "${BL}  ===========================================${CL}\n"
-
-# -----------------------------------------------------------------------------
-# If CT_ID is set and the container already exists, update in place and exit.
-# -----------------------------------------------------------------------------
-if [[ -n "$CT_ID" ]] && pct status "$CT_ID" &>/dev/null; then
-  msg_info "Container ${CT_ID} already exists — running update"
-  TMPUPDATE=$(mktemp /tmp/pinging-update-XXXXXX.sh)
-  cat > "$TMPUPDATE" << 'UPDATE_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-INSTALLED=$(cat /opt/pinging-monitor/version 2>/dev/null || echo "unknown")
-LATEST=$(git ls-remote https://github.com/geekosphere-net/lxc-isp-monitoring.git HEAD \
-          | cut -c1-7)
-if [[ "$INSTALLED" == "$LATEST" ]]; then
-  echo "Already up to date ($INSTALLED)"
-  exit 0
-fi
-echo "Updating $INSTALLED → $LATEST"
-systemctl stop pinging-monitor
-git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git \
-          /tmp/pinging-src
-cp /tmp/pinging-src/app.py            /opt/pinging-monitor/app.py
-cp -r /tmp/pinging-src/dashboard/.   /opt/pinging-monitor/dashboard/
-cp /tmp/pinging-src/requirements.txt /opt/pinging-monitor/requirements.txt
-rm -rf /tmp/pinging-src
-/opt/pinging-monitor/.venv/bin/pip install -q -r /opt/pinging-monitor/requirements.txt
-echo "$LATEST" > /opt/pinging-monitor/version
-systemctl start pinging-monitor
-echo "Updated to $LATEST"
-UPDATE_EOF
-
-  pct push "$CT_ID" "$TMPUPDATE" /tmp/pinging-update.sh --perms 0755
-  rm -f "$TMPUPDATE"
-  pct exec "$CT_ID" -- bash /tmp/pinging-update.sh \
-    && msg_ok "Update complete" \
-    || msg_error "Update failed — scroll up for details"
-  pct exec "$CT_ID" -- rm -f /tmp/pinging-update.sh
-  exit 0
-fi
 
 # -----------------------------------------------------------------------------
 # Pick a container ID if not set
@@ -250,6 +209,36 @@ SystemMaxUse=50M
 JCONF
 systemctl restart systemd-journald 2>/dev/null || true
 
+echo "--- Installing update command"
+cat > /usr/bin/update << 'UPDATESCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR=/opt/pinging-monitor
+SERVICE=pinging-monitor
+
+INSTALLED=$(cat "$INSTALL_DIR/version" 2>/dev/null || echo "unknown")
+LATEST=$(git ls-remote https://github.com/geekosphere-net/lxc-isp-monitoring.git HEAD \
+          | cut -c1-7)
+
+if [[ "$INSTALLED" == "$LATEST" ]]; then
+  echo "Already up to date ($INSTALLED)"
+  exit 0
+fi
+
+echo "Updating $INSTALLED → $LATEST"
+systemctl stop "$SERVICE"
+git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git /tmp/pinging-src
+cp /tmp/pinging-src/app.py            "$INSTALL_DIR/app.py"
+cp -r /tmp/pinging-src/dashboard/.   "$INSTALL_DIR/dashboard/"
+cp /tmp/pinging-src/requirements.txt "$INSTALL_DIR/requirements.txt"
+rm -rf /tmp/pinging-src
+"$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+echo "$LATEST" > "$INSTALL_DIR/version"
+systemctl start "$SERVICE"
+echo "Updated to $LATEST"
+UPDATESCRIPT
+chmod +x /usr/bin/update
+
 systemctl daemon-reload
 systemctl enable --now pinging-monitor
 echo "--- Install complete"
@@ -277,4 +266,4 @@ msg_ok "Completed successfully!"
 echo -e "\n  ${GN}${APP} is ready.${CL}"
 echo -e "  ${YW}Dashboard:${CL}  ${BGN}http://${IP}:8080${CL}"
 echo -e "  ${YW}Logs:${CL}       journalctl -u pinging-monitor -f  (inside CT ${CT_ID})"
-echo -e "  ${YW}Update:${CL}     CT_ID=${CT_ID} bash deploy.sh\n"
+echo -e "  ${YW}Update:${CL}     exec into CT ${CT_ID} and run: update\n"

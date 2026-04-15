@@ -1,44 +1,17 @@
 #!/usr/bin/env bash
-# setup.sh — install or update the ISP monitor on a Debian 12/13 machine or LXC.
+# setup.sh — install the ISP monitor on a Debian 12/13 machine or LXC.
 #
 # Usage:
 #   bash setup.sh          # fresh install (run from inside the cloned repo)
-#   bash setup.sh          # re-run to update in place if already installed
 #
 # Dashboard: http://<ip>:8080
 # Logs:      journalctl -u pinging-monitor -f
+# Update:    run `update` inside the LXC
 set -euo pipefail
 
 INSTALL_DIR=/opt/pinging-monitor
 SERVICE=pinging-monitor
 DATA_DIR=/var/lib/pinging-monitor
-
-# ── Update path ───────────────────────────────────────────────────────────────
-# If a version file exists this is an existing install — compare hashes and
-# update in place instead of doing a full reinstall.
-if [[ -f "$INSTALL_DIR/version" ]]; then
-  echo "==> Existing install detected — checking for update..."
-  INSTALLED=$(cat "$INSTALL_DIR/version")
-  LATEST=$(git ls-remote https://github.com/geekosphere-net/lxc-isp-monitoring.git HEAD \
-            | cut -c1-7)
-  if [[ "$INSTALLED" == "$LATEST" ]]; then
-    echo "==> Already up to date ($INSTALLED). Nothing to do."
-    exit 0
-  fi
-  echo "==> Updating $INSTALLED → $LATEST"
-  systemctl stop "$SERVICE"
-  git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git \
-            /tmp/pinging-src
-  cp /tmp/pinging-src/app.py            "$INSTALL_DIR/app.py"
-  cp -r /tmp/pinging-src/dashboard/.   "$INSTALL_DIR/dashboard/"
-  cp /tmp/pinging-src/requirements.txt "$INSTALL_DIR/requirements.txt"
-  rm -rf /tmp/pinging-src
-  "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
-  echo "$LATEST" > "$INSTALL_DIR/version"
-  systemctl start "$SERVICE"
-  echo "==> Updated to $LATEST"
-  exit 0
-fi
 
 # ── Fresh install ─────────────────────────────────────────────────────────────
 echo "==> Installing runtime dependencies..."
@@ -106,12 +79,43 @@ systemctl restart systemd-journald 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable --now "$SERVICE"
 
+echo "==> Installing update command..."
+cat > /usr/bin/update <<'UPDATESCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+INSTALL_DIR=/opt/pinging-monitor
+SERVICE=pinging-monitor
+
+INSTALLED=$(cat "$INSTALL_DIR/version" 2>/dev/null || echo "unknown")
+LATEST=$(git ls-remote https://github.com/geekosphere-net/lxc-isp-monitoring.git HEAD \
+          | cut -c1-7)
+
+if [[ "$INSTALLED" == "$LATEST" ]]; then
+  echo "Already up to date ($INSTALLED)"
+  exit 0
+fi
+
+echo "Updating $INSTALLED → $LATEST"
+systemctl stop "$SERVICE"
+git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git /tmp/pinging-src
+cp /tmp/pinging-src/app.py            "$INSTALL_DIR/app.py"
+cp -r /tmp/pinging-src/dashboard/.   "$INSTALL_DIR/dashboard/"
+cp /tmp/pinging-src/requirements.txt "$INSTALL_DIR/requirements.txt"
+rm -rf /tmp/pinging-src
+"$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+echo "$LATEST" > "$INSTALL_DIR/version"
+systemctl start "$SERVICE"
+echo "Updated to $LATEST"
+UPDATESCRIPT
+chmod +x /usr/bin/update
+
 echo ""
 echo "==> Done!"
 LXC_IP=$(hostname -I | awk '{print $1}')
 echo "    Dashboard:  http://${LXC_IP}:8080"
 echo "    Logs:       journalctl -u ${SERVICE} -f"
 echo "    Database:   ${DATA_DIR}/monitor.db"
+echo "    Update:     run 'update' inside this machine"
 echo ""
 echo "    Optional env vars (edit the [Service] section in the unit file):"
 echo "      TARGET_HOST    — default: https://pinging.net"
@@ -122,4 +126,3 @@ echo "      RETENTION_DAYS — default: 30   (days of history to keep; older row
 echo ""
 echo "    Note: WebRTC pings require outbound UDP to pinging.net:8888."
 echo "    If your LXC blocks UDP egress, HTTP pings still run."
-echo "    To update: re-run this script."
