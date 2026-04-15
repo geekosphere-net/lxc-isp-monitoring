@@ -1,27 +1,55 @@
 #!/usr/bin/env bash
-# setup.sh — run this inside a fresh Debian 12 LXC to install the ISP monitor.
+# setup.sh — install or update the ISP monitor on a Debian 12/13 machine or LXC.
 #
 # Usage:
-#   bash setup.sh
+#   bash setup.sh          # fresh install (run from inside the cloned repo)
+#   bash setup.sh          # re-run to update in place if already installed
 #
-# The dashboard will be served at http://<lxc-ip>:8080
-# Logs: journalctl -u pinging-monitor -f
+# Dashboard: http://<ip>:8080
+# Logs:      journalctl -u pinging-monitor -f
 set -euo pipefail
 
 INSTALL_DIR=/opt/pinging-monitor
 SERVICE=pinging-monitor
 DATA_DIR=/var/lib/pinging-monitor
 
-echo "==> Installing system dependencies..."
+# ── Update path ───────────────────────────────────────────────────────────────
+# If a version file exists this is an existing install — compare hashes and
+# update in place instead of doing a full reinstall.
+if [[ -f "$INSTALL_DIR/version" ]]; then
+  echo "==> Existing install detected — checking for update..."
+  INSTALLED=$(cat "$INSTALL_DIR/version")
+  LATEST=$(git ls-remote https://github.com/geekosphere-net/lxc-isp-monitoring.git HEAD \
+            | cut -c1-7)
+  if [[ "$INSTALLED" == "$LATEST" ]]; then
+    echo "==> Already up to date ($INSTALLED). Nothing to do."
+    exit 0
+  fi
+  echo "==> Updating $INSTALLED → $LATEST"
+  systemctl stop "$SERVICE"
+  git clone --depth 1 https://github.com/geekosphere-net/lxc-isp-monitoring.git \
+            /tmp/pinging-src
+  cp /tmp/pinging-src/app.py            "$INSTALL_DIR/app.py"
+  cp -r /tmp/pinging-src/dashboard/.   "$INSTALL_DIR/dashboard/"
+  cp /tmp/pinging-src/requirements.txt "$INSTALL_DIR/requirements.txt"
+  rm -rf /tmp/pinging-src
+  "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+  echo "$LATEST" > "$INSTALL_DIR/version"
+  systemctl start "$SERVICE"
+  echo "==> Updated to $LATEST"
+  exit 0
+fi
+
+# ── Fresh install ─────────────────────────────────────────────────────────────
+echo "==> Installing runtime dependencies..."
 apt-get update -q
-apt-get install -y -q \
-    python3 python3-pip python3-venv \
-    build-essential libssl-dev libffi-dev \
-    ca-certificates curl
+apt-get install -y -q python3 python3-venv git ca-certificates
+
+echo "==> Installing build dependencies (purged after compile)..."
+apt-get install -y -q build-essential libssl-dev libffi-dev
 
 echo "==> Creating directories..."
-mkdir -p "$DATA_DIR"
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$DATA_DIR" "$INSTALL_DIR"
 chown nobody:nogroup "$DATA_DIR"
 
 echo "==> Copying monitor files to $INSTALL_DIR..."
@@ -29,12 +57,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cp "$SCRIPT_DIR/app.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/dashboard" "$INSTALL_DIR/"
+git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null \
+    > "$INSTALL_DIR/version" || echo "unknown" > "$INSTALL_DIR/version"
 
 echo "==> Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/.venv"
 "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip --quiet
 echo "    Installing Python packages (aiortc build may take a few minutes)..."
 "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
+
+echo "==> Removing build dependencies..."
+apt-get purge -y --autoremove build-essential libssl-dev libffi-dev
+apt-get clean
+rm -rf /var/lib/apt/lists/*
 
 echo "==> Creating systemd service /etc/systemd/system/${SERVICE}.service..."
 cat > "/etc/systemd/system/${SERVICE}.service" <<EOF
@@ -60,6 +95,14 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+echo "==> Capping journal size to 50 MB..."
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-pinging-monitor.conf <<'JCONF'
+[Journal]
+SystemMaxUse=50M
+JCONF
+systemctl restart systemd-journald 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl enable --now "$SERVICE"
 
@@ -71,11 +114,12 @@ echo "    Logs:       journalctl -u ${SERVICE} -f"
 echo "    Database:   ${DATA_DIR}/monitor.db"
 echo ""
 echo "    Optional env vars (edit the [Service] section in the unit file):"
-echo "      TARGET_HOST   — default: https://pinging.net"
-echo "      DB_PATH       — default: ${DATA_DIR}/monitor.db"
-echo "      PING_INTERVAL — default: 1.0  (seconds between HTTP/WebRTC pings)"
+echo "      TARGET_HOST    — default: https://pinging.net"
+echo "      DB_PATH        — default: ${DATA_DIR}/monitor.db"
+echo "      PING_INTERVAL  — default: 1.0  (seconds between HTTP/WebRTC pings)"
 echo "      DNS_INTERVAL   — default: 30.0 (seconds between DNS checks)"
 echo "      RETENTION_DAYS — default: 30   (days of history to keep; older rows pruned hourly)"
 echo ""
 echo "    Note: WebRTC pings require outbound UDP to pinging.net:8888."
 echo "    If your LXC blocks UDP egress, HTTP pings still run."
+echo "    To update: re-run this script."

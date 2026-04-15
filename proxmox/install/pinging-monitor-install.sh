@@ -17,7 +17,6 @@ msg_info "Installing Dependencies (Patience)"
 $STD apt-get install -y \
   git \
   python3 \
-  python3-pip \
   python3-venv \
   build-essential \
   libssl-dev \
@@ -42,6 +41,11 @@ python3 -m venv /opt/pinging-monitor/.venv
 $STD /opt/pinging-monitor/.venv/bin/pip install --upgrade pip
 $STD /opt/pinging-monitor/.venv/bin/pip install -r /opt/pinging-monitor/requirements.txt
 msg_ok "Installed ${APP} (${INSTALLED_HASH})"
+
+msg_info "Removing Build Dependencies"
+$STD apt-get purge -y --autoremove build-essential libssl-dev libffi-dev
+$STD apt-get clean
+msg_ok "Removed Build Dependencies"
 
 msg_info "Creating Service"
 cat <<EOF >/etc/systemd/system/pinging-monitor.service
@@ -68,6 +72,15 @@ WantedBy=multi-user.target
 EOF
 systemctl enable -q --now pinging-monitor
 msg_ok "Created Service"
+
+msg_info "Configuring Log Retention"
+mkdir -p /etc/systemd/journald.conf.d
+cat >/etc/systemd/journald.conf.d/00-pinging-monitor.conf <<'JCONF'
+[Journal]
+SystemMaxUse=50M
+JCONF
+systemctl restart systemd-journald 2>/dev/null || true
+msg_ok "Configured Log Retention (50 MB cap)"
 
 motd_ssh
 customize
