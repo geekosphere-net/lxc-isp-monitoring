@@ -577,12 +577,24 @@ async def api_outages(days: int = 7) -> list[dict]:
             (cutoff,),
         ) as cursor:
             timestamps = [row[0] for row in await cursor.fetchall()]
+        # Determine whether the service was already running before the window.
+        # If the earliest ping in the DB is newer than cutoff, the service simply
+        # hadn't started yet — don't synthesise a fake leading-edge outage.
+        async with db.execute(
+            "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
+        ) as cursor:
+            row = await cursor.fetchone()
+            first_ping_ts = row[0] if row and row[0] is not None else None
 
     outages: list[dict] = []
     GAP_MS = 5000
 
     if timestamps:
-        if timestamps[0] - cutoff > GAP_MS:
+        if (
+            first_ping_ts is not None
+            and first_ping_ts < cutoff
+            and timestamps[0] - cutoff > GAP_MS
+        ):
             outages.append(
                 {
                     "start": cutoff,
