@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 import aiosqlite
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 logger = logging.getLogger(__name__)
@@ -684,6 +686,39 @@ async def api_daily(days: int = 30) -> list[dict]:
     return await _bucket_stats(cutoff, 86_400_000)
 
 
-# Serve the static dashboard — must be mounted last so API routes take precedence
+# ── Static dashboard ──
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
-app.mount("/", StaticFiles(directory=str(DASHBOARD_DIR), html=True), name="static")
+
+# Compute git hash once at startup so each deploy gets a unique asset URL,
+# busting any browser-cached JS/CSS without requiring a hard refresh.
+def _git_hash() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(DASHBOARD_DIR), "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).decode().strip()
+    except Exception:
+        return "dev"
+
+_ASSET_VERSION = _git_hash()
+
+# Build the versioned HTML once; served on every GET / with no-store so the
+# HTML is always fresh while JS/CSS are cached by their versioned URLs.
+def _versioned_html() -> str:
+    html = (DASHBOARD_DIR / "index.html").read_text()
+    html = html.replace('href="index.css"', f'href="index.css?v={_ASSET_VERSION}"')
+    html = html.replace('src="index.js"',   f'src="index.js?v={_ASSET_VERSION}"')
+    return html
+
+_DASHBOARD_HTML = _versioned_html()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    """Serve the dashboard with cache-busted asset URLs."""
+    return HTMLResponse(content=_DASHBOARD_HTML, headers={"Cache-Control": "no-store"})
+
+
+# Mount static files last — handles /index.js, /index.css, etc.
+app.mount("/", StaticFiles(directory=str(DASHBOARD_DIR)), name="static")
