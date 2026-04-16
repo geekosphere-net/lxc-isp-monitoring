@@ -11,7 +11,8 @@ const RTT_GREEN_MAX    = 100;   // ms — ITU-T G.1010 interactive threshold
 const RTT_YELLOW_MAX   = 300;   // ms — noticeable lag in real-time apps
 
 // ── Session start (used to grow the grid over time) ──
-const pageLoadMs = Date.now();
+const pageLoadMs   = Date.now();
+const initialRow   = Math.floor((pageLoadMs / 1000) / ROW_SECS);
 
 // ── State ──
 let activeTab      = "realtime";
@@ -111,12 +112,15 @@ function periodClass(p) {
 }
 
 // ── Dynamic row count ──
-// Starts at 12 rows (1 h) on first load, grows by 1 row (5 min) per ROW_SECS elapsed,
-// capping at MAX_GRID_ROWS (24 h).  Tied to real elapsed time so the grid only
-// expands as the session ages — not artificially on page refresh.
+// Starts at 12 rows (1 h) on first load, grows by 1 row each time a new 5-minute
+// wall-clock block starts, capping at MAX_GRID_ROWS (24 h).
+// Anchored to initialRow so the oldest visible row stays fixed and never drops off
+// when currentRow advances — which can happen before 5 session-minutes have elapsed
+// if the page loaded mid-block.
 function getGridRows() {
-  const elapsed = (Date.now() - pageLoadMs) / 1000;
-  return Math.min(MAX_GRID_ROWS, 12 + Math.floor(elapsed / ROW_SECS));
+  const nowSec     = Date.now() / 1000;
+  const currentRow = Math.floor(nowSec / ROW_SECS);
+  return Math.min(MAX_GRID_ROWS, 12 + (currentRow - initialRow));
 }
 
 // ── 5-second averaged grid ──
