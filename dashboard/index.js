@@ -194,7 +194,8 @@ function renderGrid() {
           ? `avg ${Math.round(b.rtts.reduce((a, c) => a + c, 0) / b.rtts.length)} ms`
           : "timeout";
         const loss  = Math.round((b.total - b.ok) / b.total * 100);
-        cell.dataset.tip = `${ts}–${tsEnd} · ${avg} · ${loss}% loss (${b.ok}/${b.total})`;
+        const pings = b.total;
+        cell.dataset.tip = `${ts}–${tsEnd} · ${avg} · ${loss}% loss · ${pings} ping${pings !== 1 ? "s" : ""}`;
       } else {
         cell.classList.add("cell-empty");
       }
