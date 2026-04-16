@@ -10,16 +10,14 @@ const MAX_GRID_ROWS    = 288;     // cap = 288 × 5 min = 24 h of history
 const RTT_GREEN_MAX    = 100;   // ms — ITU-T G.1010 interactive threshold
 const RTT_YELLOW_MAX   = 300;   // ms — noticeable lag in real-time apps
 
-// ── Session start (used to grow the grid over time) ──
-const pageLoadMs   = Date.now();
-const initialRow   = Math.floor((pageLoadMs / 1000) / ROW_SECS);
-
 // ── State ──
 let activeTab      = "realtime";
 let activeProbe    = "http";
 let histProbe      = "http";
 let statsHours     = 1;
-let resultsCache   = [];
+let bucketsCache   = {};     // bucketTs (ms) → { ts, http?, webrtc? }
+let recentResults  = [];     // last ~1 min of raw rows — status bar dots + last RTT
+let statsCache     = null;   // last /api/stats?hours=1 response — stats header
 let hourlyCache    = null;
 let dailyCache     = null;
 let lastStatusTime = 0;
@@ -51,15 +49,14 @@ async function fetchJSON(url) {
 }
 
 // ── 5s bucket → CSS color class ──
-// b = { ok, total, rtts[] } — averaged over the 5-second window
+// b = { ok, total, avg_rtt, ... } — per-probe sub-object from /api/buckets
 function bucketClass(b) {
   if (!b || b.total === 0) return "cell-empty";
   const lossFrac = (b.total - b.ok) / b.total;
   if (lossFrac >= 0.5) return "cell-red";
-  if (b.rtts.length === 0) return "cell-red";
-  const avg = b.rtts.reduce((a, c) => a + c, 0) / b.rtts.length;
-  if (avg < RTT_GREEN_MAX)  return "cell-green";
-  if (avg < RTT_YELLOW_MAX) return "cell-yellow";
+  if (b.avg_rtt == null) return "cell-red";
+  if (b.avg_rtt < RTT_GREEN_MAX)  return "cell-green";
+  if (b.avg_rtt < RTT_YELLOW_MAX) return "cell-yellow";
   return "cell-orange";
 }
 
@@ -69,7 +66,7 @@ function renderStatusBar() {
     const ind = document.getElementById(`ind-${type}`);
     if (!ind) continue;
 
-    const ofType = resultsCache.filter(r => r.type === type);
+    const ofType = recentResults.filter(r => r.type === type);
     const last   = ofType.length ? ofType[ofType.length - 1] : null;
     const lastOk = [...ofType].reverse().find(r => r.success);
 
@@ -82,22 +79,22 @@ function renderStatusBar() {
 }
 
 // ── Stats header ──
+// "Last" comes from recentResults (most recent single ping RTT).
+// Min / Max / Avg / Loss come from statsCache (/api/stats?hours=1).
 function renderStatsHeader() {
-  const rows   = resultsCache.filter(r => r.type === activeProbe);
-  const lastOk = [...rows].reverse().find(r => r.success && r.rtt_ms != null);
-  const okRtts = rows.filter(r => r.success && r.rtt_ms != null).map(r => r.rtt_ms);
-  const total  = rows.length;
-  const failed = rows.filter(r => !r.success).length;
+  const s      = statsCache ? statsCache[activeProbe] : null;
+  const lastOk = [...recentResults]
+    .reverse()
+    .find(r => r.type === activeProbe && r.success && r.rtt_ms != null);
 
-  const fms = v => `${Math.round(v)} ms`;
+  const fms  = v => (v != null ? `${Math.round(v)} ms` : "—");
+  const fpct = v => (v != null ? `${v}%` : "—");
 
   document.getElementById("sh-last").textContent = lastOk ? fms(lastOk.rtt_ms) : "—";
-  document.getElementById("sh-min").textContent  = okRtts.length ? fms(Math.min(...okRtts)) : "—";
-  document.getElementById("sh-max").textContent  = okRtts.length ? fms(Math.max(...okRtts)) : "—";
-  document.getElementById("sh-avg").textContent  = okRtts.length
-    ? fms(okRtts.reduce((a, b) => a + b, 0) / okRtts.length) : "—";
-  document.getElementById("sh-loss").textContent = total > 0
-    ? `${((failed / total) * 100).toFixed(2)}%` : "—";
+  document.getElementById("sh-min").textContent  = s ? fms(s.min_rtt) : "—";
+  document.getElementById("sh-max").textContent  = s ? fms(s.max_rtt) : "—";
+  document.getElementById("sh-avg").textContent  = s ? fms(s.avg_rtt) : "—";
+  document.getElementById("sh-loss").textContent = s ? fpct(s.packet_loss_pct) : "—";
 }
 
 // ── Period bucket → CSS color class (shared by hourly + daily) ──
@@ -111,62 +108,25 @@ function periodClass(p) {
   return "cell-orange";
 }
 
-// ── Dynamic row count ──
-// Starts at 12 rows (1 h) on first load, grows by 1 row each time a new 5-minute
-// wall-clock block starts, capping at MAX_GRID_ROWS (24 h).
-// Anchored to initialRow so the oldest visible row stays fixed and never drops off
-// when currentRow advances — which can happen before 5 session-minutes have elapsed
-// if the page loaded mid-block.
-function getGridRows() {
-  const nowSec     = Date.now() / 1000;
-  const currentRow = Math.floor(nowSec / ROW_SECS);
-  return Math.min(MAX_GRID_ROWS, 12 + (currentRow - initialRow));
-}
-
-// ── 5-second averaged grid ──
-// Each cell = BUCKET_SECS (5s) average · each row = CELLS_PER_ROW × 5s = 5 min
+// ── 5-second grid — fixed 288 rows (24 h) ──
+// Each cell = one 5s bucket from bucketsCache.
+// Lookup key: bucket start timestamp in ms = rowStart + col × BUCKET_SECS × 1000,
+// which always lands on a 5000 ms boundary matching the server's (ts/5000)*5000.
 function renderGrid() {
-  const container  = document.getElementById("grid");
-  const nowMs      = Date.now();
-  const nowSec     = nowMs / 1000;
+  const container = document.getElementById("grid");
+  const nowSec    = Date.now() / 1000;
 
-  // Current row = which 5-minute block we're in
   const currentRow = Math.floor(nowSec / ROW_SECS);
-  // Current cell column within the top row (0–59)
   const currentCol = Math.floor((nowSec % ROW_SECS) / BUCKET_SECS);
-
-  // Build bucket map: bucketKey → { ok, total, rtts[] }
-  // bucketKey = Math.floor(ts_seconds / BUCKET_SECS)  — unique per 5s window
-  const bucketMap = {};
-  for (const r of resultsCache) {
-    if (r.type !== activeProbe) continue;
-    const key = Math.floor(r.ts / (BUCKET_SECS * 1000));
-    if (!bucketMap[key]) bucketMap[key] = { ok: 0, total: 0, rtts: [] };
-    bucketMap[key].total++;
-    if (r.success) {
-      bucketMap[key].ok++;
-      if (r.rtt_ms != null) bucketMap[key].rtts.push(r.rtt_ms);
-    }
-  }
 
   container.innerHTML = "";
 
-  // Update subtitle label ("last hour" → "last 2 hours" → … → "last 24 hours")
-  const rows      = getGridRows();
-  const totalMins = rows * CELLS_PER_ROW * BUCKET_SECS / 60;
-  const subEl     = document.getElementById("grid-subtitle");
-  if (subEl) {
-    if (totalMins <= 60) {
-      subEl.textContent = "last hour";
-    } else {
-      const h = totalMins / 60;
-      subEl.textContent = `last ${Number.isInteger(h) ? h : h.toFixed(1)} hours`;
-    }
-  }
+  const subEl = document.getElementById("grid-subtitle");
+  if (subEl) subEl.textContent = "last 24 hours";
 
-  for (let rowIdx = 0; rowIdx < rows; rowIdx++) {
+  for (let rowIdx = 0; rowIdx < MAX_GRID_ROWS; rowIdx++) {
     const rowNum   = currentRow - rowIdx;
-    const rowStart = rowNum * ROW_SECS * 1000;   // ms
+    const rowStart = rowNum * ROW_SECS * 1000;  // ms
 
     const rowEl = document.createElement("div");
     rowEl.className = "g-row";
@@ -182,24 +142,22 @@ function renderGrid() {
     cellsEl.className = "g-cells";
 
     for (let col = 0; col < CELLS_PER_ROW; col++) {
-      const bucketKey = rowNum * CELLS_PER_ROW + col;
-      const b         = bucketMap[bucketKey];
-      const cell      = document.createElement("div");
-      cell.className  = "g-cell";
+      const bucketTs = rowStart + col * BUCKET_SECS * 1000;
+      const bucket   = bucketsCache[bucketTs];
+      const b        = bucket ? bucket[activeProbe] : undefined;
+      const cell     = document.createElement("div");
+      cell.className = "g-cell";
 
       const isFuture = rowIdx === 0 && col > currentCol;
       if (isFuture) {
         cell.classList.add("cell-empty", "cell-future");
       } else if (b) {
         cell.classList.add(bucketClass(b));
-        const ts    = new Date(rowStart + col * BUCKET_SECS * 1000).toLocaleTimeString();
-        const tsEnd = new Date(rowStart + (col + 1) * BUCKET_SECS * 1000).toLocaleTimeString();
-        const avg   = b.rtts.length
-          ? `avg ${Math.round(b.rtts.reduce((a, c) => a + c, 0) / b.rtts.length)} ms`
-          : "timeout";
-        const loss  = Math.round((b.total - b.ok) / b.total * 100);
-        const pings = b.total;
-        cell.dataset.tip = `${ts}–${tsEnd} · ${avg} · ${loss}% loss · ${pings} ping${pings !== 1 ? "s" : ""}`;
+        const ts    = new Date(bucketTs).toLocaleTimeString();
+        const tsEnd = new Date(bucketTs + BUCKET_SECS * 1000).toLocaleTimeString();
+        const avg   = b.avg_rtt != null ? `avg ${Math.round(b.avg_rtt)} ms` : "timeout";
+        const loss  = b.total > 0 ? Math.round((b.total - b.ok) / b.total * 100) : 0;
+        cell.dataset.tip = `${ts}–${tsEnd} · ${avg} · ${loss}% loss · ${b.total} ping${b.total !== 1 ? "s" : ""}`;
       } else {
         cell.classList.add("cell-empty");
       }
@@ -224,37 +182,23 @@ setInterval(() => {
 }, 1000);
 
 // ── Background data fetch (every 5s) ──
-// First call: fetches the last 62 minutes to pre-fill the grid.
-// Subsequent calls: fetch only a 3-minute overlap window and merge new rows
-// into the existing cache.  This keeps each incremental request tiny (~40 KB)
-// while the in-memory cache grows up to 24 h as the session ages.
+// First call: /api/buckets?hours=24 — full 24 h of pre-aggregated 5s buckets.
+// Subsequent calls: /api/buckets?seconds=10 — last 2 bucket windows only.
+// Merge by ts key so the current partial bucket is overwritten as it accumulates.
 async function fetchData() {
   if (fetching) return;
   fetching = true;
   try {
-    const isFirst = resultsCache.length === 0;
-    const minutes = isFirst ? 62 : 3;
-    const fresh   = await fetchJSON(`/api/results?minutes=${minutes}`);
+    const isFirst = Object.keys(bucketsCache).length === 0;
+    const url     = isFirst ? "/api/buckets?hours=24" : "/api/buckets?seconds=10";
+    const fresh   = await fetchJSON(url);
 
-    if (isFirst) {
-      resultsCache = fresh;
-    } else {
-      // Merge: add only rows not already in cache (dedup on ts + type)
-      const seen = new Set(resultsCache.map(r => `${r.ts}|${r.type}`));
-      for (const r of fresh) {
-        const key = `${r.ts}|${r.type}`;
-        if (!seen.has(key)) { resultsCache.push(r); seen.add(key); }
-      }
-      // Prune to last 24 h so memory stays bounded
-      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-      if (resultsCache.length > 10_000) {
-        resultsCache = resultsCache.filter(r => r.ts >= cutoff);
-      }
+    for (const bucket of fresh) {
+      bucketsCache[bucket.ts] = bucket;
     }
 
-    if (backendOnline !== true)  { backendOnline = true;  renderConnBadge(); }
+    if (backendOnline !== true) { backendOnline = true; renderConnBadge(); }
     renderGrid();
-    renderStatusBar();
   } catch (e) {
     console.error("Data fetch failed:", e);
     if (backendOnline !== false) { backendOnline = false; renderConnBadge(); }
@@ -264,11 +208,22 @@ async function fetchData() {
 }
 
 // ── Status bar + stats header refresh (every 30s) ──
-function refreshStatus() {
-  if (resultsCache.length === 0) return;
-  renderStatusBar();
-  renderStatsHeader();
-  lastStatusTime = Date.now();
+// Fetches /api/results?minutes=1 (dots + last RTT) and /api/stats?hours=1
+// (aggregate stats) in parallel, then re-renders both status rows.
+async function refreshStatus() {
+  try {
+    const [fresh, stats] = await Promise.all([
+      fetchJSON("/api/results?minutes=1"),
+      fetchJSON("/api/stats?hours=1"),
+    ]);
+    recentResults = fresh;
+    statsCache    = stats;
+    renderStatusBar();
+    renderStatsHeader();
+    lastStatusTime = Date.now();
+  } catch (e) {
+    console.error("Status refresh failed:", e);
+  }
 }
 
 // ── Historical tab ──
@@ -507,11 +462,8 @@ document.querySelectorAll(".win-btn").forEach(btn => {
 
 // ── Boot ──
 (async () => {
-  await fetchData();
-  renderStatusBar();
-  renderStatsHeader();
+  await Promise.all([fetchData(), refreshStatus()]);
   renderGrid();
-  lastStatusTime = Date.now();
 })();
 setInterval(fetchData, DATA_POLL_MS);
 setInterval(refreshStatus, STATUS_POLL_MS);

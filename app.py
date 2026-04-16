@@ -560,6 +560,21 @@ async def api_stats(hours: int = 24) -> dict:
     return stats
 
 
+@app.get("/api/buckets")
+async def api_buckets(hours: int = 24, seconds: int = 0) -> list[dict]:
+    """Pre-aggregated 5-second bucket stats for the realtime grid.
+
+    Use ``hours`` for the initial full load (default 24 h = 288 rows of 60 cells).
+    Use ``seconds`` for incremental fetches (e.g. seconds=10 fetches the last
+    2 bucket windows).  When ``seconds`` is non-zero it takes precedence.
+    """
+    if seconds > 0:
+        cutoff = int((time.time() - seconds) * 1000)
+    else:
+        cutoff = int((time.time() - hours * 3600) * 1000)
+    return await _bucket_stats(cutoff, 5_000)
+
+
 @app.get("/api/outages")
 async def api_outages(days: int = 7) -> list[dict]:
     """
@@ -644,6 +659,7 @@ async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
             periods[period_ts] = {"ts": period_ts}
         periods[period_ts][type_] = {
             "total": total,
+            "ok": ok,
             "uptime_pct": round(ok / total * 100, 1) if total else None,
             "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
             "avg_rtt": round(avg_rtt, 1) if avg_rtt is not None else None,
