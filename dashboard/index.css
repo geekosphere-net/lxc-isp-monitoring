@@ -225,11 +225,19 @@ h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
   padding: 0.875rem 1rem;
 }
 
+.grid-panel-hdr {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+
 .legend {
   display: flex;
   gap: 0.875rem;
   flex-wrap: wrap;
-  margin-bottom: 0.75rem;
 }
 .leg {
   font-size: 0.7rem;

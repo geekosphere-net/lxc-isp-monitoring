@@ -6,9 +6,12 @@ const STATUS_POLL_MS   = 30_000;  // status bar + stats header refresh interval
 const BUCKET_SECS      = 5;       // seconds averaged into each grid cell
 const CELLS_PER_ROW    = 60;      // cells per row
 const ROW_SECS         = BUCKET_SECS * CELLS_PER_ROW;  // 300s = 5 min per row
-const GRID_ROWS        = 12;      // rows shown = 12 × 5 min = 60 min of history
+const MAX_GRID_ROWS    = 288;     // cap = 288 × 5 min = 24 h of history
 const RTT_GREEN_MAX    = 100;   // ms — ITU-T G.1010 interactive threshold
 const RTT_YELLOW_MAX   = 300;   // ms — noticeable lag in real-time apps
+
+// ── Session start (used to grow the grid over time) ──
+const pageLoadMs = Date.now();
 
 // ── State ──
 let activeTab      = "realtime";
@@ -107,9 +110,17 @@ function periodClass(p) {
   return "cell-orange";
 }
 
+// ── Dynamic row count ──
+// Starts at 12 rows (1 h) on first load, grows by 1 row (5 min) per ROW_SECS elapsed,
+// capping at MAX_GRID_ROWS (24 h).  Tied to real elapsed time so the grid only
+// expands as the session ages — not artificially on page refresh.
+function getGridRows() {
+  const elapsed = (Date.now() - pageLoadMs) / 1000;
+  return Math.min(MAX_GRID_ROWS, 12 + Math.floor(elapsed / ROW_SECS));
+}
+
 // ── 5-second averaged grid ──
 // Each cell = BUCKET_SECS (5s) average · each row = CELLS_PER_ROW × 5s = 5 min
-// GRID_ROWS rows = 12 × 5 min = 60 min of history
 function renderGrid() {
   const container  = document.getElementById("grid");
   const nowMs      = Date.now();
@@ -136,7 +147,20 @@ function renderGrid() {
 
   container.innerHTML = "";
 
-  for (let rowIdx = 0; rowIdx < GRID_ROWS; rowIdx++) {
+  // Update subtitle label ("last hour" → "last 2 hours" → … → "last 24 hours")
+  const rows      = getGridRows();
+  const totalMins = rows * CELLS_PER_ROW * BUCKET_SECS / 60;
+  const subEl     = document.getElementById("grid-subtitle");
+  if (subEl) {
+    if (totalMins <= 60) {
+      subEl.textContent = "last hour";
+    } else {
+      const h = totalMins / 60;
+      subEl.textContent = `last ${Number.isInteger(h) ? h : h.toFixed(1)} hours`;
+    }
+  }
+
+  for (let rowIdx = 0; rowIdx < rows; rowIdx++) {
     const rowNum   = currentRow - rowIdx;
     const rowStart = rowNum * ROW_SECS * 1000;   // ms
 
@@ -183,24 +207,49 @@ function renderGrid() {
   }
 }
 
-// ── 1-second ticker: grid re-render + DNS next + status countdown ──
-// Grid is driven purely by time + cache — independent of the 30s status cycle.
+// ── 1-second ticker: status countdown only ──
+// Grid re-render is driven by fetchData (every 5 s).  currentCol only
+// advances on 5-second boundaries anyway (BUCKET_SECS = 5), so there is
+// no visual benefit to rebuilding the DOM every second.
 setInterval(() => {
-  if (resultsCache.length > 0) renderGrid();
-
   const remaining = Math.max(0, STATUS_POLL_MS - (Date.now() - lastStatusTime));
   const secs = Math.ceil(remaining / 1000);
   const el   = document.getElementById("refresh-countdown");
   if (el) el.textContent = secs <= 0 ? "Checking…" : `Refreshing in ${secs}s`;
 }, 1000);
 
-// ── Background data fetch (every 5s — keeps cache fresh for the grid) ──
+// ── Background data fetch (every 5s) ──
+// First call: fetches the last 62 minutes to pre-fill the grid.
+// Subsequent calls: fetch only a 3-minute overlap window and merge new rows
+// into the existing cache.  This keeps each incremental request tiny (~40 KB)
+// while the in-memory cache grows up to 24 h as the session ages.
 async function fetchData() {
   if (fetching) return;
   fetching = true;
   try {
-    resultsCache = await fetchJSON("/api/results?minutes=61");
+    const isFirst = resultsCache.length === 0;
+    const minutes = isFirst ? 62 : 3;
+    const fresh   = await fetchJSON(`/api/results?minutes=${minutes}`);
+
+    if (isFirst) {
+      resultsCache = fresh;
+    } else {
+      // Merge: add only rows not already in cache (dedup on ts + type)
+      const seen = new Set(resultsCache.map(r => `${r.ts}|${r.type}`));
+      for (const r of fresh) {
+        const key = `${r.ts}|${r.type}`;
+        if (!seen.has(key)) { resultsCache.push(r); seen.add(key); }
+      }
+      // Prune to last 24 h so memory stays bounded
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      if (resultsCache.length > 10_000) {
+        resultsCache = resultsCache.filter(r => r.ts >= cutoff);
+      }
+    }
+
     if (backendOnline !== true)  { backendOnline = true;  renderConnBadge(); }
+    renderGrid();
+    renderStatusBar();
   } catch (e) {
     console.error("Data fetch failed:", e);
     if (backendOnline !== false) { backendOnline = false; renderConnBadge(); }

@@ -70,12 +70,15 @@
 
     <!-- Second-by-second grid -->
     <section class="grid-panel">
-      <div class="legend">
-        <span class="leg green">Excellent (&lt;100 ms avg)</span>
-        <span class="leg yellow">Elevated (100–300 ms avg)</span>
-        <span class="leg orange">Poor (&gt;300 ms avg)</span>
-        <span class="leg red">Lost (≥50% failure)</span>
-        <span class="leg nodata">No data</span>
+      <div class="grid-panel-hdr">
+        <div class="legend">
+          <span class="leg green">Excellent (&lt;100 ms avg)</span>
+          <span class="leg yellow">Elevated (100–300 ms avg)</span>
+          <span class="leg orange">Poor (&gt;300 ms avg)</span>
+          <span class="leg red">Lost (≥50% failure)</span>
+          <span class="leg nodata">No data</span>
+        </div>
+        <span id="grid-subtitle" class="panel-subtitle">last hour</span>
       </div>
       <div id="grid"></div>
     </section>
