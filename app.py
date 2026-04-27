@@ -457,7 +457,6 @@ async def prune_loop() -> None:
         cutoff = int((time.time() - RETENTION_DAYS * 86400) * 1000)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM pings WHERE ts < ?", (cutoff,))
-            await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             await db.commit()
         logger.info("Pruned rows older than %d days", RETENTION_DAYS)
         await asyncio.sleep(3600)
@@ -496,14 +495,26 @@ async def webrtc_ping_loop() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _supervise(coro_fn, name: str, restart_delay: float = 5.0):
+    """Run coro_fn() in a loop, restarting it if it raises an unexpected exception."""
+    while True:
+        try:
+            await coro_fn()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Loop %r crashed — restarting in %.0fs", name, restart_delay)
+            await asyncio.sleep(restart_delay)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     await _init_db()
     tasks = [
-        asyncio.create_task(http_ping_loop(), name="http-ping"),
-        asyncio.create_task(dns_check_loop(), name="dns-check"),
-        asyncio.create_task(webrtc_ping_loop(), name="webrtc-ping"),
-        asyncio.create_task(prune_loop(), name="prune"),
+        asyncio.create_task(_supervise(http_ping_loop, "http-ping"), name="http-ping"),
+        asyncio.create_task(_supervise(dns_check_loop, "dns-check"), name="dns-check"),
+        asyncio.create_task(_supervise(webrtc_ping_loop, "webrtc-ping"), name="webrtc-ping"),
+        asyncio.create_task(_supervise(prune_loop, "prune"), name="prune"),
     ]
     yield
     for t in tasks:
