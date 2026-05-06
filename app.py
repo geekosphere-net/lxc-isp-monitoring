@@ -136,6 +136,10 @@ DNS_INTERVAL = float(os.environ.get("DNS_INTERVAL", "30.0"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "false", "no")
 
+# Single shared connection — aiosqlite serialises all ops on one background
+# thread, so there is never more than one writer and no "database is locked".
+_db: aiosqlite.Connection | None = None
+
 # Shared counters passed to the server during WebRTC session negotiation
 # (mirrors what the browser frontend does)
 _num_successful = 0
@@ -155,23 +159,28 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-async def _init_db() -> None:
+async def _init_db() -> aiosqlite.Connection:
+    global _db
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pings (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts      INTEGER NOT NULL,   -- Unix milliseconds
-                type    TEXT    NOT NULL,   -- 'http' | 'webrtc' | 'dns'
-                success INTEGER NOT NULL,   -- 1 or 0
-                rtt_ms  REAL,               -- NULL on failure
-                error   TEXT                -- NULL on success
-            )
-            """
+    _db = await aiosqlite.connect(DB_PATH)
+    await _db.execute("PRAGMA journal_mode=WAL")
+    await _db.execute("PRAGMA busy_timeout=5000")
+    await _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pings (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts      INTEGER NOT NULL,   -- Unix milliseconds
+            type    TEXT    NOT NULL,   -- 'http' | 'webrtc' | 'dns'
+            success INTEGER NOT NULL,   -- 1 or 0
+            rtt_ms  REAL,               -- NULL on failure
+            error   TEXT                -- NULL on success
         )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_pings_ts ON pings(ts)")
-        await db.commit()
+        """
+    )
+    await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_ts ON pings(ts)")
+    await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_type_ts ON pings(type, ts)")
+    await _db.commit()
+    return _db
 
 
 async def _record(
@@ -181,12 +190,11 @@ async def _record(
     error: str | None = None,
 ) -> None:
     ts = int(time.time() * 1000)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO pings (ts, type, success, rtt_ms, error) VALUES (?, ?, ?, ?, ?)",
-            (ts, type_, 1 if success else 0, rtt_ms, error),
-        )
-        await db.commit()
+    await _db.execute(
+        "INSERT INTO pings (ts, type, success, rtt_ms, error) VALUES (?, ?, ?, ?, ?)",
+        (ts, type_, 1 if success else 0, rtt_ms, error),
+    )
+    await _db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -455,9 +463,8 @@ async def prune_loop() -> None:
     """Delete rows older than RETENTION_DAYS once per hour."""
     while True:
         cutoff = int((time.time() - RETENTION_DAYS * 86400) * 1000)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM pings WHERE ts < ?", (cutoff,))
-            await db.commit()
+        await _db.execute("DELETE FROM pings WHERE ts < ?", (cutoff,))
+        await _db.commit()
         logger.info("Pruned rows older than %d days", RETENTION_DAYS)
         await asyncio.sleep(3600)
 
@@ -520,6 +527,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await _db.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -529,13 +537,12 @@ app = FastAPI(lifespan=lifespan)
 async def api_results(minutes: int = 1440) -> list[dict]:
     """Return raw ping rows for the last N minutes (default 24h)."""
     cutoff = int((time.time() - minutes * 60) * 1000)
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT ts, type, success, rtt_ms, error FROM pings WHERE ts >= ? ORDER BY ts",
-            (cutoff,),
-        ) as cursor:
-            return [dict(r) for r in await cursor.fetchall()]
+    cols = ("ts", "type", "success", "rtt_ms", "error")
+    async with _db.execute(
+        "SELECT ts, type, success, rtt_ms, error FROM pings WHERE ts >= ? ORDER BY ts",
+        (cutoff,),
+    ) as cursor:
+        return [dict(zip(cols, r)) for r in await cursor.fetchall()]
 
 
 @app.get("/api/stats")
@@ -543,22 +550,21 @@ async def api_stats(hours: int = 24) -> dict:
     """Return uptime/RTT statistics per test type for the last N hours."""
     cutoff = int((time.time() - hours * 3600) * 1000)
     stats: dict = {}
-    async with aiosqlite.connect(DB_PATH) as db:
-        for type_ in ("http", "webrtc", "dns"):
-            async with db.execute(
-                """
-                SELECT
-                    COUNT(*)                                    AS total,
-                    SUM(success)                                AS ok,
-                    AVG(CASE WHEN success=1 THEN rtt_ms END)   AS avg_rtt,
-                    MIN(CASE WHEN success=1 THEN rtt_ms END)   AS min_rtt,
-                    MAX(CASE WHEN success=1 THEN rtt_ms END)   AS max_rtt
-                FROM pings
-                WHERE ts >= ? AND type = ?
-                """,
-                (cutoff, type_),
-            ) as cursor:
-                row = await cursor.fetchone()
+    for type_ in ("http", "webrtc", "dns"):
+        async with _db.execute(
+            """
+            SELECT
+                COUNT(*)                                    AS total,
+                SUM(success)                                AS ok,
+                AVG(CASE WHEN success=1 THEN rtt_ms END)   AS avg_rtt,
+                MIN(CASE WHEN success=1 THEN rtt_ms END)   AS min_rtt,
+                MAX(CASE WHEN success=1 THEN rtt_ms END)   AS max_rtt
+            FROM pings
+            WHERE ts >= ? AND type = ?
+            """,
+            (cutoff, type_),
+        ) as cursor:
+            row = await cursor.fetchone()
             total = (row[0] or 0) if row else 0
             ok = (row[1] or 0) if row else 0
             avg_rtt, min_rtt, max_rtt = (row[2], row[3], row[4]) if row else (None, None, None)
@@ -595,24 +601,23 @@ async def api_outages(days: int = 7) -> list[dict]:
     An outage is a gap > 5s with no successful HTTP or WebRTC ping.
     """
     cutoff = int((time.time() - days * 86400) * 1000)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT ts FROM pings
-            WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')
-            ORDER BY ts
-            """,
-            (cutoff,),
-        ) as cursor:
-            timestamps = [row[0] for row in await cursor.fetchall()]
-        # Determine whether the service was already running before the window.
-        # If the earliest ping in the DB is newer than cutoff, the service simply
-        # hadn't started yet — don't synthesise a fake leading-edge outage.
-        async with db.execute(
-            "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
-        ) as cursor:
-            row = await cursor.fetchone()
-            first_ping_ts = row[0] if row and row[0] is not None else None
+    async with _db.execute(
+        """
+        SELECT ts FROM pings
+        WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')
+        ORDER BY ts
+        """,
+        (cutoff,),
+    ) as cursor:
+        timestamps = [row[0] for row in await cursor.fetchall()]
+    # Determine whether the service was already running before the window.
+    # If the earliest ping in the DB is newer than cutoff, the service simply
+    # hadn't started yet — don't synthesise a fake leading-edge outage.
+    async with _db.execute(
+        "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
+    ) as cursor:
+        row = await cursor.fetchone()
+        first_ping_ts = row[0] if row and row[0] is not None else None
 
     outages: list[dict] = []
     GAP_MS = 5000
@@ -646,25 +651,24 @@ async def api_outages(days: int = 7) -> list[dict]:
 
 async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
     """Aggregate ping stats into fixed-size time buckets (hourly or daily)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """
-            SELECT
-              (ts / ?) * ?  AS period_ts,
-              type,
-              COUNT(*)      AS total,
-              SUM(success)  AS ok,
-              AVG(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS avg_rtt,
-              MIN(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS min_rtt,
-              MAX(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS max_rtt
-            FROM pings
-            WHERE ts >= ? AND type IN ('http', 'webrtc')
-            GROUP BY period_ts, type
-            ORDER BY period_ts ASC
-            """,
-            (bucket_ms, bucket_ms, cutoff),
-        ) as cursor:
-            rows = await cursor.fetchall()
+    async with _db.execute(
+        """
+        SELECT
+          (ts / ?) * ?  AS period_ts,
+          type,
+          COUNT(*)      AS total,
+          SUM(success)  AS ok,
+          AVG(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS avg_rtt,
+          MIN(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS min_rtt,
+          MAX(CASE WHEN success = 1 AND rtt_ms IS NOT NULL THEN rtt_ms END) AS max_rtt
+        FROM pings
+        WHERE ts >= ? AND type IN ('http', 'webrtc')
+        GROUP BY period_ts, type
+        ORDER BY period_ts ASC
+        """,
+        (bucket_ms, bucket_ms, cutoff),
+    ) as cursor:
+        rows = await cursor.fetchall()
 
     periods: dict[int, dict] = {}
     for period_ts, type_, total, ok, avg_rtt, min_rtt, max_rtt in rows:
