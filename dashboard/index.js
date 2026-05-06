@@ -227,6 +227,7 @@ async function refreshStatus() {
     lastStatusTime = Date.now();
   } catch (e) {
     console.error("Status refresh failed:", e);
+    if (backendOnline !== false) { backendOnline = false; renderConnBadge(); }
   }
 }
 
@@ -517,7 +518,7 @@ document.querySelectorAll(".win-btn").forEach(btn => {
     tip.classList.add("visible");
     const x = e.clientX + 14;
     const y = e.clientY - 32;
-    tip.style.left = Math.min(x, window.innerWidth  - tip.offsetWidth  - 8) + "px";
+    tip.style.left = Math.max(8, Math.min(x, window.innerWidth - tip.offsetWidth - 8)) + "px";
     tip.style.top  = Math.max(8, y) + "px";
   });
 

@@ -399,8 +399,19 @@ tr:last-child td { border-bottom: none; }
   margin-bottom: 0.5rem;
 }
 
+/* Probe toggle scope label (heatmap panel) */
+.probe-toggle-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.2rem;
+}
+.probe-toggle-scope {
+  font-size: 0.62rem;
+  color: var(--muted);
+}
+
 /* Hourly strip — 24 cells, full width */
-.hourly-strip { }
 
 .h-cells {
   display: flex;
@@ -435,7 +446,7 @@ tr:last-child td { border-bottom: none; }
 .cal-header,
 .cal-row {
   display: grid;
-  grid-template-columns: 3.5rem repeat(7, 28px);
+  grid-template-columns: 3.5rem repeat(7, min(28px, calc((100% - 3.5rem - 21px) / 7)));
   gap: 3px;
   margin-bottom: 3px;
   align-items: center;
@@ -456,8 +467,8 @@ tr:last-child td { border-bottom: none; }
 }
 
 .cal-cell {
-  width: 28px;
-  height: 28px;
+  width: 100%;
+  aspect-ratio: 1;
   border-radius: 3px;
   cursor: default;
 }
