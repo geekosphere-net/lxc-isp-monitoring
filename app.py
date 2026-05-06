@@ -21,7 +21,7 @@ from pathlib import Path
 
 import aiosqlite
 import httpx
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -139,6 +139,11 @@ WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "
 # Single shared connection — aiosqlite serialises all ops on one background
 # thread, so there is never more than one writer and no "database is locked".
 _db: aiosqlite.Connection | None = None
+
+
+async def _db_ready() -> None:
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database initialising")
 
 # Server-side cache for the expensive daily aggregation, keyed by days param.
 _daily_cache: dict[int, tuple[float, list]] = {}  # days → (fetched_at_epoch, result)
@@ -551,11 +556,13 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 
 
 app = FastAPI(lifespan=lifespan)
+_api = APIRouter(dependencies=[Depends(_db_ready)])
 
 
-@app.get("/api/results")
+@_api.get("/api/results")
 async def api_results(minutes: int = 1440) -> list[dict]:
-    """Return raw ping rows for the last N minutes (default 24h)."""
+    """Return raw ping rows for the last N minutes (default 24h, max 7d)."""
+    minutes = min(minutes, 10_080)
     cutoff = int((time.time() - minutes * 60) * 1000)
     cols = ("ts", "type", "success", "rtt_ms", "error")
     async with _db.execute(
@@ -565,29 +572,35 @@ async def api_results(minutes: int = 1440) -> list[dict]:
         return [dict(zip(cols, r)) for r in await cursor.fetchall()]
 
 
-@app.get("/api/stats")
+@_api.get("/api/stats")
 async def api_stats(hours: int = 24) -> dict:
     """Return uptime/RTT statistics per test type for the last N hours."""
     cutoff = int((time.time() - hours * 3600) * 1000)
-    stats: dict = {}
-    for type_ in ("http", "webrtc", "dns"):
-        async with _db.execute(
-            """
-            SELECT
-                COUNT(*)                                    AS total,
-                SUM(success)                                AS ok,
-                AVG(CASE WHEN success=1 THEN rtt_ms END)   AS avg_rtt,
-                MIN(CASE WHEN success=1 THEN rtt_ms END)   AS min_rtt,
-                MAX(CASE WHEN success=1 THEN rtt_ms END)   AS max_rtt
-            FROM pings
-            WHERE ts >= ? AND type = ?
-            """,
-            (cutoff, type_),
-        ) as cursor:
-            row = await cursor.fetchone()
-            total = (row[0] or 0) if row else 0
-            ok = (row[1] or 0) if row else 0
-            avg_rtt, min_rtt, max_rtt = (row[2], row[3], row[4]) if row else (None, None, None)
+    # Seed all three types so callers always get a complete dict even if a
+    # probe has no rows in the requested window.
+    stats: dict = {
+        t: {"total": 0, "uptime_pct": None, "packet_loss_pct": None,
+            "avg_rtt": None, "min_rtt": None, "max_rtt": None}
+        for t in ("http", "webrtc", "dns")
+    }
+    async with _db.execute(
+        """
+        SELECT
+            type,
+            COUNT(*)                                    AS total,
+            SUM(success)                                AS ok,
+            AVG(CASE WHEN success=1 THEN rtt_ms END)   AS avg_rtt,
+            MIN(CASE WHEN success=1 THEN rtt_ms END)   AS min_rtt,
+            MAX(CASE WHEN success=1 THEN rtt_ms END)   AS max_rtt
+        FROM pings
+        WHERE ts >= ? AND type IN ('http', 'webrtc', 'dns')
+        GROUP BY type
+        """,
+        (cutoff,),
+    ) as cursor:
+        for type_, total, ok, avg_rtt, min_rtt, max_rtt in await cursor.fetchall():
+            total = total or 0
+            ok = ok or 0
             stats[type_] = {
                 "total": total,
                 "uptime_pct": round(ok / total * 100, 2) if total else None,
@@ -599,7 +612,7 @@ async def api_stats(hours: int = 24) -> dict:
     return stats
 
 
-@app.get("/api/buckets")
+@_api.get("/api/buckets")
 async def api_buckets(hours: int = 24, seconds: int = 0) -> list[dict]:
     """Pre-aggregated 5-second bucket stats for the realtime grid.
 
@@ -614,7 +627,7 @@ async def api_buckets(hours: int = 24, seconds: int = 0) -> list[dict]:
     return await _bucket_stats(cutoff, 5_000)
 
 
-@app.get("/api/outages")
+@_api.get("/api/outages")
 async def api_outages(days: int = 7) -> list[dict]:
     """
     Return outage events for the last N days.
@@ -709,14 +722,14 @@ async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
     return sorted(periods.values(), key=lambda x: x["ts"])
 
 
-@app.get("/api/hourly")
+@_api.get("/api/hourly")
 async def api_hourly(hours: int = 24) -> list[dict]:
     """Per-hour RTT/uptime stats for the last N hours (HTTP and WebRTC)."""
     cutoff = int((time.time() - hours * 3600) * 1000)
     return await _bucket_stats(cutoff, 3_600_000)
 
 
-@app.get("/api/daily")
+@_api.get("/api/daily")
 async def api_daily(days: int = 30) -> list[dict]:
     """Per-day RTT/uptime stats for the last N days (HTTP and WebRTC)."""
     cached = _daily_cache.get(days)
@@ -727,6 +740,8 @@ async def api_daily(days: int = 30) -> list[dict]:
     _daily_cache[days] = (time.time(), result)
     return result
 
+
+app.include_router(_api)
 
 # ── Static dashboard ──
 DASHBOARD_DIR = Path(__file__).parent / "dashboard"
