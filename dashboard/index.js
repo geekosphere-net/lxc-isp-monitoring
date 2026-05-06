@@ -128,9 +128,6 @@ function renderGrid() {
 
   container.innerHTML = "";
 
-  const subEl = document.getElementById("grid-subtitle");
-  if (subEl) subEl.textContent = "last 24 hours";
-
   for (let rowIdx = 0; rowIdx < MAX_GRID_ROWS; rowIdx++) {
     const rowNum   = currentRow - rowIdx;
     const rowStart = rowNum * ROW_SECS * 1000;  // ms
@@ -294,6 +291,9 @@ async function loadHistoryTab({ statsChanged = false } = {}) {
     work.push(fetchJSON("/api/outages?days=7").then(d => {
       if (statsHours !== hours) return;
       outagesCache = d; renderOutages(d);
+    }).catch(() => {
+      document.getElementById("outages-body").innerHTML =
+        `<tr><td colspan="3" class="empty">Failed to load outages</td></tr>`;
     }));
   }
 
@@ -427,14 +427,15 @@ function renderStats(stats) {
   const types = { http: "HTTP", webrtc: "WebRTC", dns: "DNS" };
   grid.innerHTML = Object.entries(types).map(([key, label]) => {
     const s = stats[key] || {};
-    const v = (val, unit = "") => val != null ? `${val}${unit}` : "—";
+    const v   = (val, unit = "") => val != null ? `${val}${unit}` : "—";
+    const fms = val => val != null ? `${Math.round(val)} ms` : "—";
     const minmax = (s.min_rtt != null && s.max_rtt != null)
-      ? `${s.min_rtt} / ${s.max_rtt} ms` : "—";
+      ? `${Math.round(s.min_rtt)} / ${Math.round(s.max_rtt)} ms` : "—";
     return `
       <div class="stat-group">
         <div class="stat-group-title">${label}</div>
         <div class="stat-row"><span class="stat-lbl">Uptime</span>      <span class="stat-val">${v(s.uptime_pct, "%")}</span></div>
-        <div class="stat-row"><span class="stat-lbl">Avg RTT</span>     <span class="stat-val">${v(s.avg_rtt, " ms")}</span></div>
+        <div class="stat-row"><span class="stat-lbl">Avg RTT</span>     <span class="stat-val">${fms(s.avg_rtt)}</span></div>
         <div class="stat-row"><span class="stat-lbl">Min / Max</span>   <span class="stat-val">${minmax}</span></div>
         <div class="stat-row"><span class="stat-lbl">Packet loss</span> <span class="stat-val">${v(s.packet_loss_pct, "%")}</span></div>
       </div>`;
