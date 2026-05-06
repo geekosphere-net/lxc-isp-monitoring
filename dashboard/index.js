@@ -22,9 +22,7 @@ let hourlyCache    = null;
 let dailyCache     = null;
 let outagesCache   = null;
 let histStatsCache = null;   // /api/stats response for the history stats panel
-let histStatsHours = null;   // statsHours value that histStatsCache was fetched with
-let histSlowFetchedAt = 0;   // when hourly/daily/outages were last fetched
-const HIST_SLOW_TTL_MS = 5 * 60 * 1000;  // re-fetch hourly/daily/outages at most every 5 min
+let histStatsHours = null;   // statsHours value histStatsCache was fetched for
 let lastStatusTime = 0;
 let fetching       = false;
 let backendOnline  = null;   // null = unknown (initial), true = online, false = offline
@@ -232,41 +230,55 @@ async function refreshStatus() {
 }
 
 // ── Historical tab ──
-// statsChanged=true forces a stats re-fetch even if the cache is warm (used
-// when the window selector changes).  Everything else uses a 5-minute TTL.
+// What gets fetched depends on which window is selected:
+//   1h  → stats only (fast, ~130ms)
+//   24h → stats + hourly strip + outages
+//   7d  → stats + hourly strip + daily calendar + outages
+// Each dataset is cached for the page session and re-used on subsequent
+// tab switches.  statsChanged=true forces stats to re-fetch (window changed).
 async function loadHistoryTab({ statsChanged = false } = {}) {
-  const slowStale  = (Date.now() - histSlowFetchedAt) > HIST_SLOW_TTL_MS;
-  const statsStale = statsChanged || histStatsCache === null || histStatsHours !== statsHours;
+  // Reveal/hide panels for the current window before any fetch
+  updateHistPanels();
 
-  // Render immediately from whatever cache we have — tab feels instant
-  if (histStatsCache) renderStats(histStatsCache);
-  if (outagesCache)   renderOutages(outagesCache);
-  if (hourlyCache)    renderHourly(hourlyCache);
-  if (dailyCache)     renderDaily(dailyCache);
+  // Render whatever is already cached (instant if returning to tab)
+  if (histStatsCache)                       renderStats(histStatsCache);
+  if (hourlyCache  && statsHours >= 24)     renderHourly(hourlyCache);
+  if (dailyCache   && statsHours >= 168)    renderDaily(dailyCache);
+  if (outagesCache && statsHours >= 24)     renderOutages(outagesCache);
 
-  if (!statsStale && !slowStale) return;
+  const statsStale   = statsChanged || !histStatsCache || histStatsHours !== statsHours;
+  const hourlyNeeded = statsHours >= 24  && !hourlyCache;
+  const dailyNeeded  = statsHours >= 168 && !dailyCache;
+  const outagesNeeded = statsHours >= 24 && !outagesCache;
 
-  try {
-    const work = [];
-    if (statsStale) {
-      work.push(
-        fetchJSON(`/api/stats?hours=${statsHours}`).then(d => {
-          histStatsCache = d; histStatsHours = statsHours; renderStats(d);
-        })
-      );
-    }
-    if (slowStale) {
-      histSlowFetchedAt = Date.now();  // optimistic — prevents parallel storm on fast clicks
-      work.push(
-        fetchJSON("/api/outages?days=7").then(d => { outagesCache = d; renderOutages(d); }),
-        fetchJSON("/api/hourly?hours=24").then(d => { hourlyCache  = d; renderHourly(d); }),
-        fetchJSON("/api/daily?days=30").then(d  => { dailyCache   = d; renderDaily(d);  }),
-      );
-    }
-    await Promise.all(work);
-  } catch (e) {
-    console.error("History fetch failed:", e);
+  if (!statsStale && !hourlyNeeded && !dailyNeeded && !outagesNeeded) return;
+
+  const work = [];
+  if (statsStale) {
+    work.push(fetchJSON(`/api/stats?hours=${statsHours}`).then(d => {
+      histStatsCache = d; histStatsHours = statsHours; renderStats(d);
+    }));
   }
+  if (hourlyNeeded) {
+    work.push(fetchJSON("/api/hourly?hours=24").then(d => { hourlyCache  = d; renderHourly(d); }));
+  }
+  if (dailyNeeded) {
+    work.push(fetchJSON("/api/daily?days=30").then(d => { dailyCache = d; renderDaily(d); }));
+  }
+  if (outagesNeeded) {
+    work.push(fetchJSON("/api/outages?days=7").then(d => { outagesCache = d; renderOutages(d); }));
+  }
+
+  await Promise.all(work).catch(e => console.error("History fetch failed:", e));
+}
+
+// Show/hide the 24h and 7d panels based on the selected window button.
+function updateHistPanels() {
+  const show24 = statsHours >= 24;
+  const show7d = statsHours >= 168;
+  document.getElementById("hist-heatmap-panel").classList.toggle("hidden", !show24);
+  document.getElementById("hist-daily-section").classList.toggle("hidden", !show7d);
+  document.getElementById("hist-outages-panel").classList.toggle("hidden", !show24);
 }
 
 // ── Hourly strip (24 cells, one per hour) ──

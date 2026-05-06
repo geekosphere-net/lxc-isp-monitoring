@@ -102,7 +102,7 @@
     </section>
 
     <!-- Hourly + Daily latency heatmaps with shared probe toggle -->
-    <section class="panel">
+    <section id="hist-heatmap-panel" class="panel hidden">
       <div class="panel-header">
         <h2>Latency Heatmap</h2>
         <div class="probe-toggle">
@@ -122,12 +122,14 @@
       <div class="hist-section-label">Hourly — Last 24 Hours</div>
       <div id="hourly-strip" class="hourly-strip"></div>
 
-      <div class="hist-section-label" style="margin-top: 1.5rem;">Daily — Last 30 Days</div>
-      <div id="daily-calendar"></div>
+      <div id="hist-daily-section" class="hidden">
+        <div class="hist-section-label" style="margin-top: 1.5rem;">Daily — Last 30 Days</div>
+        <div id="daily-calendar"></div>
+      </div>
     </section>
 
     <!-- Recent outages -->
-    <section class="panel">
+    <section id="hist-outages-panel" class="panel hidden">
       <div class="panel-header">
         <h2>Recent Outages</h2>
         <span class="panel-subtitle">last 7 days · gaps &gt; 5 s with no successful ping</span>

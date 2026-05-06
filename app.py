@@ -140,6 +140,10 @@ WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "
 # thread, so there is never more than one writer and no "database is locked".
 _db: aiosqlite.Connection | None = None
 
+# Server-side cache for the expensive 30-day daily aggregation.
+_daily_cache: tuple[float, list] | None = None  # (fetched_at_epoch, result)
+_DAILY_CACHE_TTL = 300.0  # seconds
+
 # Shared counters passed to the server during WebRTC session negotiation
 # (mirrors what the browser frontend does)
 _num_successful = 0
@@ -179,6 +183,11 @@ async def _init_db() -> aiosqlite.Connection:
     )
     await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_ts ON pings(ts)")
     await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_type_ts ON pings(type, ts)")
+    # Covering index lets the aggregation queries (stats, hourly, daily) be
+    # answered entirely from the index without touching main table pages.
+    await _db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pings_cover ON pings(type, ts, success, rtt_ms)"
+    )
     await _db.commit()
     return _db
 
@@ -601,50 +610,52 @@ async def api_outages(days: int = 7) -> list[dict]:
     An outage is a gap > 5s with no successful HTTP or WebRTC ping.
     """
     cutoff = int((time.time() - days * 86400) * 1000)
+    GAP_MS = 5000
+
+    # Use SQL LAG window function to find gaps in a single ordered pass —
+    # avoids loading all timestamps into Python memory.
     async with _db.execute(
         """
-        SELECT ts FROM pings
-        WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')
-        ORDER BY ts
+        WITH ordered AS (
+            SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts
+            FROM pings
+            WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')
+        )
+        SELECT prev_ts, ts
+        FROM ordered
+        WHERE prev_ts IS NOT NULL AND ts - prev_ts > ?
+        ORDER BY prev_ts
         """,
-        (cutoff,),
+        (cutoff, GAP_MS),
     ) as cursor:
-        timestamps = [row[0] for row in await cursor.fetchall()]
-    # Determine whether the service was already running before the window.
-    # If the earliest ping in the DB is newer than cutoff, the service simply
-    # hadn't started yet — don't synthesise a fake leading-edge outage.
+        rows = await cursor.fetchall()
+
+    outages = [
+        {"start": r[0], "end": r[1], "duration_s": round((r[1] - r[0]) / 1000, 1)}
+        for r in rows
+    ]
+
+    # Check for a leading-edge gap: service was running before this window but
+    # had no successful ping right at the window boundary.
     async with _db.execute(
         "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
     ) as cursor:
         row = await cursor.fetchone()
         first_ping_ts = row[0] if row and row[0] is not None else None
 
-    outages: list[dict] = []
-    GAP_MS = 5000
-
-    if timestamps:
-        if (
-            first_ping_ts is not None
-            and first_ping_ts < cutoff
-            and timestamps[0] - cutoff > GAP_MS
-        ):
-            outages.append(
-                {
-                    "start": cutoff,
-                    "end": timestamps[0],
-                    "duration_s": round((timestamps[0] - cutoff) / 1000, 1),
-                }
-            )
-        for i in range(1, len(timestamps)):
-            gap = timestamps[i] - timestamps[i - 1]
-            if gap > GAP_MS:
-                outages.append(
-                    {
-                        "start": timestamps[i - 1],
-                        "end": timestamps[i],
-                        "duration_s": round(gap / 1000, 1),
-                    }
-                )
+    if first_ping_ts is not None and first_ping_ts < cutoff:
+        async with _db.execute(
+            "SELECT MIN(ts) FROM pings WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')",
+            (cutoff,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            first_in_window = row[0] if row and row[0] is not None else None
+        if first_in_window and first_in_window - cutoff > GAP_MS:
+            outages.insert(0, {
+                "start": cutoff,
+                "end": first_in_window,
+                "duration_s": round((first_in_window - cutoff) / 1000, 1),
+            })
 
     return outages
 
@@ -697,8 +708,13 @@ async def api_hourly(hours: int = 24) -> list[dict]:
 @app.get("/api/daily")
 async def api_daily(days: int = 30) -> list[dict]:
     """Per-day RTT/uptime stats for the last N days (HTTP and WebRTC)."""
+    global _daily_cache
+    if _daily_cache is not None and time.time() - _daily_cache[0] < _DAILY_CACHE_TTL:
+        return _daily_cache[1]
     cutoff = int((time.time() - days * 86400) * 1000)
-    return await _bucket_stats(cutoff, 86_400_000)
+    result = await _bucket_stats(cutoff, 86_400_000)
+    _daily_cache = (time.time(), result)
+    return result
 
 
 # ── Static dashboard ──
