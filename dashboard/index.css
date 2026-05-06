@@ -93,6 +93,7 @@ h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
 }
 .tab-btn.active { background: var(--accent); color: #fff; }
 .tab-btn:not(.active):hover { color: var(--text); }
+.tab-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ── Tab panels ── */
 .tab-panel.hidden { display: none; }
@@ -203,7 +204,8 @@ h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
   border-radius: 6px;
   padding: 0.15rem;
 }
-.probe-btn {
+.probe-btn,
+.hist-probe-btn {
   background: none;
   border: none;
   color: var(--muted);
@@ -214,8 +216,12 @@ h1 { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.01em; }
   font-weight: 500;
   transition: background 0.15s, color 0.15s;
 }
-.probe-btn.active { background: var(--accent); color: #fff; }
-.probe-btn:not(.active):hover { color: var(--text); }
+.probe-btn.active,
+.hist-probe-btn.active { background: var(--accent); color: #fff; }
+.probe-btn:not(.active):hover,
+.hist-probe-btn:not(.active):hover { color: var(--text); }
+.probe-btn:focus-visible,
+.hist-probe-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ── Grid panel ── */
 .grid-panel {
@@ -337,6 +343,7 @@ h2 { font-size: 0.9rem; font-weight: 600; }
 }
 .win-btn:hover  { border-color: var(--accent); color: var(--text); }
 .win-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.win-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ── Stats grid (historical tab) ── */
 #stats-grid {

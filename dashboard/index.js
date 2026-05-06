@@ -80,8 +80,11 @@ function renderStatusBar() {
     const dot = ind.querySelector(".probe-dot");
     dot.className = "probe-dot" + (last ? (last.success ? " dot-up" : " dot-down") : "");
 
-    ind.querySelector(".probe-rtt").textContent =
-      (lastOk && lastOk.rtt_ms != null) ? `${Math.round(lastOk.rtt_ms)} ms` : "— ms";
+    const rttText = (lastOk && lastOk.rtt_ms != null) ? `${Math.round(lastOk.rtt_ms)} ms` : "— ms";
+    ind.querySelector(".probe-rtt").textContent = rttText;
+
+    const status = last ? (last.success ? "up" : "down") : "unknown";
+    ind.setAttribute("aria-label", `${type.toUpperCase()}: ${status}, ${rttText}`);
   }
 }
 

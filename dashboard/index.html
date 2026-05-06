@@ -134,11 +134,11 @@
     <!-- Recent outages -->
     <section id="hist-outages-panel" class="panel hidden">
       <div class="panel-header">
-        <h2>Recent Outages</h2>
+        <h2 id="outages-heading">Recent Outages</h2>
         <span class="panel-subtitle">last 7 days · gaps &gt; 5 s with no successful ping</span>
       </div>
       <div class="table-wrap">
-        <table>
+        <table aria-labelledby="outages-heading">
           <thead><tr><th>Start</th><th>End</th><th>Duration</th></tr></thead>
           <tbody id="outages-body">
             <tr><td colspan="3" class="empty">Loading…</td></tr>
