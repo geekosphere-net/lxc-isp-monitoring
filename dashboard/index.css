@@ -502,7 +502,6 @@ tr:last-child td { border-bottom: none; }
 /* ── Responsive ── */
 @media (max-width: 600px) {
   .probe-indicators { gap: 1rem; }
-  .stats-values     { gap: 0; }
   .stat-item        { padding: 0 0.5rem; }
   .stat-sep         { display: none; }
   #stats-grid       { grid-template-columns: 1fr; }

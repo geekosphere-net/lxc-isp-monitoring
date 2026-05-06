@@ -365,6 +365,10 @@ function renderHourly(data) {
 function renderDaily(data) {
   const DAY_MS = 86_400_000;
   const now    = Date.now();
+  // Day boundaries are UTC midnight to match the server's (ts/86400000)*86400000
+  // buckets. Cells near local midnight in non-UTC timezones may appear one day
+  // off — a cosmetic edge case; fixing it would require aligning server buckets
+  // to local midnight instead.
   const todayUTC = Math.floor(now / DAY_MS) * DAY_MS;
 
   // Build day map: day_ts (UTC midnight) → probe stats
