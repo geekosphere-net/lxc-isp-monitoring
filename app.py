@@ -136,6 +136,9 @@ DNS_INTERVAL = float(os.environ.get("DNS_INTERVAL", "30.0"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "false", "no")
 
+HOUR_MS = 3_600_000   # milliseconds in one hour
+GAP_MS  = 5_000       # outage gap threshold in milliseconds
+
 # Single shared connection — aiosqlite serialises all ops on one background
 # thread, so there is never more than one writer and no "database is locked".
 _db: aiosqlite.Connection | None = None
@@ -144,10 +147,6 @@ _db: aiosqlite.Connection | None = None
 async def _db_ready() -> None:
     if _db is None:
         raise HTTPException(status_code=503, detail="Database initialising")
-
-# Server-side cache for the expensive daily aggregation, keyed by days param.
-_daily_cache: dict[int, tuple[float, list]] = {}  # days → (fetched_at_epoch, result)
-_DAILY_CACHE_TTL = 300.0  # seconds
 
 # Shared counters passed to the server during WebRTC session negotiation
 # (mirrors what the browser frontend does)
@@ -199,7 +198,40 @@ async def _init_db() -> aiosqlite.Connection:
     await _db.execute(
         "CREATE INDEX IF NOT EXISTS idx_pings_cover ON pings(type, ts, success, rtt_ms)"
     )
+    await _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hourly_summary (
+            hour_ts  INTEGER NOT NULL,
+            type     TEXT    NOT NULL,
+            total    INTEGER NOT NULL DEFAULT 0,
+            ok       INTEGER NOT NULL DEFAULT 0,
+            sum_rtt  REAL    NOT NULL DEFAULT 0,
+            min_rtt  REAL,
+            max_rtt  REAL,
+            PRIMARY KEY (hour_ts, type)
+        )
+        """
+    )
+    await _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS outage_events (
+            start_ts    INTEGER NOT NULL PRIMARY KEY,
+            end_ts      INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL
+        )
+        """
+    )
+    await _db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT    PRIMARY KEY,
+            value INTEGER NOT NULL
+        )
+        """
+    )
     await _db.commit()
+    # Backfill summary tables from existing raw pings on first run / upgrade
+    await _run_summarize()
     return _db
 
 
@@ -215,6 +247,123 @@ async def _record(
         (ts, type_, 1 if success else 0, rtt_ms, error),
     )
     await _db.commit()
+
+
+async def _run_summarize() -> None:
+    """
+    Aggregate completed hours into hourly_summary and detect ping gaps into
+    outage_events.  Called once at startup (full backfill) and then every 60 s
+    by summarize_loop (incremental).
+    """
+    now_ms       = int(time.time() * 1000)
+    current_hour = (now_ms // HOUR_MS) * HOUR_MS
+
+    # ── 1. hourly_summary: fill all completed hours not yet aggregated ──────
+    async with _db.execute("SELECT MAX(hour_ts) FROM hourly_summary") as cur:
+        row = await cur.fetchone()
+        last_summarized = row[0] if row and row[0] is not None else None
+
+    if last_summarized is None:
+        # First run — go back RETENTION_DAYS
+        from_hour = ((now_ms - RETENTION_DAYS * 86_400_000) // HOUR_MS) * HOUR_MS
+    else:
+        from_hour = last_summarized + HOUR_MS
+
+    if from_hour < current_hour:
+        await _db.execute(
+            """
+            INSERT OR IGNORE INTO hourly_summary
+                (hour_ts, type, total, ok, sum_rtt, min_rtt, max_rtt)
+            SELECT
+                (ts / ?) * ?   AS hour_ts,
+                type,
+                COUNT(*)       AS total,
+                SUM(success)   AS ok,
+                SUM(CASE WHEN success=1 AND rtt_ms IS NOT NULL THEN rtt_ms ELSE 0 END)
+                               AS sum_rtt,
+                MIN(CASE WHEN success=1 THEN rtt_ms END) AS min_rtt,
+                MAX(CASE WHEN success=1 THEN rtt_ms END) AS max_rtt
+            FROM pings
+            WHERE ts >= ? AND ts < ?
+            GROUP BY hour_ts, type
+            """,
+            (HOUR_MS, HOUR_MS, from_hour, current_hour),
+        )
+        logger.info("hourly_summary: backfilled hours %d → %d", from_hour, current_hour)
+
+    # ── 2. outage_events: detect gaps since last watermark ───────────────────
+    async with _db.execute("SELECT value FROM meta WHERE key='outage_scan_watermark'") as cur:
+        row = await cur.fetchone()
+        watermark = row[0] if row and row[0] is not None else None
+
+    if watermark is None:
+        watermark = int((time.time() - 7 * 86400) * 1000)
+        # Leading-edge check: gap between window start and first successful ping
+        async with _db.execute(
+            "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
+        ) as cur:
+            row = await cur.fetchone()
+            first_ever = row[0] if row and row[0] is not None else None
+        if first_ever is not None and first_ever < watermark:
+            async with _db.execute(
+                "SELECT MIN(ts) FROM pings WHERE ts >= ? AND success=1"
+                " AND type IN ('http', 'webrtc')",
+                (watermark,),
+            ) as cur:
+                row = await cur.fetchone()
+                first_ok = row[0] if row and row[0] is not None else None
+            if first_ok and first_ok - watermark > GAP_MS:
+                await _db.execute(
+                    "INSERT OR IGNORE INTO outage_events"
+                    " (start_ts, end_ts, duration_ms) VALUES (?, ?, ?)",
+                    (watermark, first_ok, first_ok - watermark),
+                )
+
+    async with _db.execute(
+        """
+        WITH ordered AS (
+            SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts
+            FROM pings
+            WHERE ts > ? AND success = 1 AND type IN ('http', 'webrtc')
+        )
+        SELECT prev_ts, ts, ts - prev_ts AS duration_ms
+        FROM ordered
+        WHERE prev_ts IS NOT NULL AND ts - prev_ts > ?
+        ORDER BY prev_ts
+        """,
+        (watermark, GAP_MS),
+    ) as cursor:
+        gaps = await cursor.fetchall()
+
+    for start_ts, end_ts, duration_ms in gaps:
+        await _db.execute(
+            "INSERT OR IGNORE INTO outage_events (start_ts, end_ts, duration_ms)"
+            " VALUES (?, ?, ?)",
+            (start_ts, end_ts, duration_ms),
+        )
+    if gaps:
+        logger.info("outage_events: detected %d gap(s) since watermark %d", len(gaps), watermark)
+
+    # Advance watermark — 10 s buffer avoids missing late-arriving pings
+    new_watermark = now_ms - 10_000
+    await _db.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('outage_scan_watermark', ?)",
+        (new_watermark,),
+    )
+
+    # ── 3. Prune old summary rows ────────────────────────────────────────────
+    prune_cutoff = int((time.time() - RETENTION_DAYS * 86_400) * 1000)
+    await _db.execute("DELETE FROM hourly_summary WHERE hour_ts < ?", (prune_cutoff,))
+    await _db.execute("DELETE FROM outage_events WHERE start_ts < ?", (prune_cutoff,))
+
+    await _db.commit()
+
+
+async def summarize_loop() -> None:
+    """Incrementally update hourly_summary and outage_events every 60 s."""
+    while True:
+        await asyncio.sleep(60)
+        await _run_summarize()
 
 
 # ---------------------------------------------------------------------------
@@ -544,10 +693,11 @@ async def _supervise(coro_fn, name: str, restart_delay: float = 5.0):
 async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     await _init_db()
     tasks = [
-        asyncio.create_task(_supervise(http_ping_loop, "http-ping"), name="http-ping"),
-        asyncio.create_task(_supervise(dns_check_loop, "dns-check"), name="dns-check"),
-        asyncio.create_task(_supervise(webrtc_ping_loop, "webrtc-ping"), name="webrtc-ping"),
-        asyncio.create_task(_supervise(prune_loop, "prune"), name="prune"),
+        asyncio.create_task(_supervise(http_ping_loop,    "http-ping"),  name="http-ping"),
+        asyncio.create_task(_supervise(dns_check_loop,    "dns-check"),  name="dns-check"),
+        asyncio.create_task(_supervise(webrtc_ping_loop,  "webrtc-ping"),name="webrtc-ping"),
+        asyncio.create_task(_supervise(prune_loop,        "prune"),       name="prune"),
+        asyncio.create_task(_supervise(summarize_loop,    "summarize"),   name="summarize"),
     ]
     yield
     for t in tasks:
@@ -576,41 +726,73 @@ async def api_results(minutes: int = 1440) -> list[dict]:
 @_api.get("/api/stats")
 async def api_stats(hours: int = 24) -> dict:
     """Return uptime/RTT statistics per test type for the last N hours."""
-    cutoff = int((time.time() - hours * 3600) * 1000)
-    # Seed all three types so callers always get a complete dict even if a
-    # probe has no rows in the requested window.
-    stats: dict = {
-        t: {"total": 0, "uptime_pct": None, "packet_loss_pct": None,
-            "avg_rtt": None, "min_rtt": None, "max_rtt": None}
+    now_ms       = int(time.time() * 1000)
+    cutoff_ms    = now_ms - hours * HOUR_MS
+    current_hour = (now_ms // HOUR_MS) * HOUR_MS
+    # First complete hour whose start >= cutoff (ceiling division)
+    first_complete = ((cutoff_ms + HOUR_MS - 1) // HOUR_MS) * HOUR_MS
+
+    acc = {
+        t: {"total": 0, "ok": 0, "sum_rtt": 0.0, "min_rtt": None, "max_rtt": None}
         for t in ("http", "webrtc", "dns")
     }
+
+    def _merge(d: dict, total, ok, sum_rtt, min_rtt, max_rtt) -> None:
+        d["total"]   += total   or 0
+        d["ok"]      += ok      or 0
+        d["sum_rtt"] += sum_rtt or 0.0
+        if min_rtt is not None:
+            d["min_rtt"] = min_rtt if d["min_rtt"] is None else min(d["min_rtt"], min_rtt)
+        if max_rtt is not None:
+            d["max_rtt"] = max_rtt if d["max_rtt"] is None else max(d["max_rtt"], max_rtt)
+
+    # Completed hours from hourly_summary (fast path — index scan on PK)
+    if first_complete < current_hour:
+        async with _db.execute(
+            """
+            SELECT type, SUM(total), SUM(ok), SUM(sum_rtt), MIN(min_rtt), MAX(max_rtt)
+            FROM hourly_summary
+            WHERE hour_ts >= ? AND hour_ts < ?
+            GROUP BY type
+            """,
+            (first_complete, current_hour),
+        ) as cursor:
+            for row in await cursor.fetchall():
+                if row[0] in acc:
+                    _merge(acc[row[0]], *row[1:])
+
+    # Partial periods from raw pings:
+    #   • the fractional start hour  [cutoff_ms, first_complete)
+    #   • the current incomplete hour [current_hour, now)
     async with _db.execute(
         """
-        SELECT
-            type,
-            COUNT(*)                                    AS total,
-            SUM(success)                                AS ok,
-            AVG(CASE WHEN success=1 THEN rtt_ms END)   AS avg_rtt,
-            MIN(CASE WHEN success=1 THEN rtt_ms END)   AS min_rtt,
-            MAX(CASE WHEN success=1 THEN rtt_ms END)   AS max_rtt
+        SELECT type, COUNT(*), SUM(success),
+               SUM(CASE WHEN success=1 AND rtt_ms IS NOT NULL THEN rtt_ms ELSE 0 END),
+               MIN(CASE WHEN success=1 THEN rtt_ms END),
+               MAX(CASE WHEN success=1 THEN rtt_ms END)
         FROM pings
-        WHERE ts >= ? AND type IN ('http', 'webrtc', 'dns')
+        WHERE ts >= ? AND (ts < ? OR ts >= ?) AND type IN ('http', 'webrtc', 'dns')
         GROUP BY type
         """,
-        (cutoff,),
+        (cutoff_ms, first_complete, current_hour),
     ) as cursor:
-        for type_, total, ok, avg_rtt, min_rtt, max_rtt in await cursor.fetchall():
-            total = total or 0
-            ok = ok or 0
-            stats[type_] = {
-                "total": total,
-                "uptime_pct": round(ok / total * 100, 2) if total else None,
-                "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
-                "avg_rtt": round(avg_rtt, 1) if avg_rtt is not None else None,
-                "min_rtt": round(min_rtt, 1) if min_rtt is not None else None,
-                "max_rtt": round(max_rtt, 1) if max_rtt is not None else None,
-            }
-    return stats
+        for row in await cursor.fetchall():
+            if row[0] in acc:
+                _merge(acc[row[0]], *row[1:])
+
+    result: dict = {}
+    for t, d in acc.items():
+        total, ok = d["total"], d["ok"]
+        avg_rtt   = d["sum_rtt"] / ok if ok > 0 else None
+        result[t] = {
+            "total":           total,
+            "uptime_pct":      round(ok / total * 100, 2)         if total else None,
+            "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
+            "avg_rtt":  round(avg_rtt,      1) if avg_rtt         is not None else None,
+            "min_rtt":  round(d["min_rtt"], 1) if d["min_rtt"]    is not None else None,
+            "max_rtt":  round(d["max_rtt"], 1) if d["max_rtt"]    is not None else None,
+        }
+    return result
 
 
 @_api.get("/api/buckets")
@@ -630,59 +812,18 @@ async def api_buckets(hours: int = 24, seconds: int = 0) -> list[dict]:
 
 @_api.get("/api/outages")
 async def api_outages(days: int = 7) -> list[dict]:
-    """
-    Return outage events for the last N days.
-    An outage is a gap > 5s with no successful HTTP or WebRTC ping.
-    """
+    """Return outage events for the last N days (gaps > 5 s with no successful ping)."""
     cutoff = int((time.time() - days * 86400) * 1000)
-    GAP_MS = 5000
-
-    # Use SQL LAG window function to find gaps in a single ordered pass —
-    # avoids loading all timestamps into Python memory.
     async with _db.execute(
-        """
-        WITH ordered AS (
-            SELECT ts, LAG(ts) OVER (ORDER BY ts) AS prev_ts
-            FROM pings
-            WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')
-        )
-        SELECT prev_ts, ts
-        FROM ordered
-        WHERE prev_ts IS NOT NULL AND ts - prev_ts > ?
-        ORDER BY prev_ts
-        """,
-        (cutoff, GAP_MS),
+        "SELECT start_ts, end_ts, duration_ms FROM outage_events"
+        " WHERE start_ts >= ? ORDER BY start_ts",
+        (cutoff,),
     ) as cursor:
         rows = await cursor.fetchall()
-
-    outages = [
-        {"start": r[0], "end": r[1], "duration_s": round((r[1] - r[0]) / 1000, 1)}
+    return [
+        {"start": r[0], "end": r[1], "duration_s": round(r[2] / 1000, 1)}
         for r in rows
     ]
-
-    # Check for a leading-edge gap: service was running before this window but
-    # had no successful ping right at the window boundary.
-    async with _db.execute(
-        "SELECT MIN(ts) FROM pings WHERE type IN ('http', 'webrtc')"
-    ) as cursor:
-        row = await cursor.fetchone()
-        first_ping_ts = row[0] if row and row[0] is not None else None
-
-    if first_ping_ts is not None and first_ping_ts < cutoff:
-        async with _db.execute(
-            "SELECT MIN(ts) FROM pings WHERE ts >= ? AND success = 1 AND type IN ('http', 'webrtc')",
-            (cutoff,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            first_in_window = row[0] if row and row[0] is not None else None
-        if first_in_window and first_in_window - cutoff > GAP_MS:
-            outages.insert(0, {
-                "start": cutoff,
-                "end": first_in_window,
-                "duration_s": round((first_in_window - cutoff) / 1000, 1),
-            })
-
-    return outages
 
 
 async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
@@ -726,20 +867,100 @@ async def _bucket_stats(cutoff: int, bucket_ms: int) -> list[dict]:
 @_api.get("/api/hourly")
 async def api_hourly(hours: int = 24) -> list[dict]:
     """Per-hour RTT/uptime stats for the last N hours (HTTP and WebRTC)."""
-    cutoff = int((time.time() - hours * 3600) * 1000)
-    return await _bucket_stats(cutoff, 3_600_000)
+    now_ms       = int(time.time() * 1000)
+    cutoff_ms    = now_ms - hours * HOUR_MS
+    current_hour = (now_ms // HOUR_MS) * HOUR_MS
+
+    periods: dict[int, dict] = {}
+
+    def _to_period(total, ok, sum_rtt, min_rtt, max_rtt) -> dict:
+        avg_rtt = sum_rtt / ok if ok > 0 else None
+        return {
+            "total": total, "ok": ok,
+            "uptime_pct":      round(ok / total * 100, 1)           if total else None,
+            "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
+            "avg_rtt":  round(avg_rtt,  1) if avg_rtt  is not None else None,
+            "min_rtt":  round(min_rtt,  1) if min_rtt  is not None else None,
+            "max_rtt":  round(max_rtt,  1) if max_rtt  is not None else None,
+        }
+
+    # Completed hours from hourly_summary
+    async with _db.execute(
+        """
+        SELECT hour_ts, type, total, ok, sum_rtt, min_rtt, max_rtt
+        FROM hourly_summary
+        WHERE hour_ts >= ? AND hour_ts < ? AND type IN ('http', 'webrtc')
+        ORDER BY hour_ts
+        """,
+        (cutoff_ms, current_hour),
+    ) as cursor:
+        for hour_ts, type_, total, ok, sum_rtt, min_rtt, max_rtt in await cursor.fetchall():
+            if hour_ts not in periods:
+                periods[hour_ts] = {"ts": hour_ts}
+            periods[hour_ts][type_] = _to_period(total, ok, sum_rtt, min_rtt, max_rtt)
+
+    # Current incomplete hour from raw pings
+    if current_hour >= cutoff_ms:
+        async with _db.execute(
+            """
+            SELECT type, COUNT(*), SUM(success),
+                   SUM(CASE WHEN success=1 AND rtt_ms IS NOT NULL THEN rtt_ms ELSE 0 END),
+                   MIN(CASE WHEN success=1 THEN rtt_ms END),
+                   MAX(CASE WHEN success=1 THEN rtt_ms END)
+            FROM pings
+            WHERE ts >= ? AND type IN ('http', 'webrtc')
+            GROUP BY type
+            """,
+            (current_hour,),
+        ) as cursor:
+            for type_, total, ok, sum_rtt, min_rtt, max_rtt in await cursor.fetchall():
+                if current_hour not in periods:
+                    periods[current_hour] = {"ts": current_hour}
+                periods[current_hour][type_] = _to_period(total, ok, sum_rtt, min_rtt, max_rtt)
+
+    return sorted(periods.values(), key=lambda x: x["ts"])
 
 
 @_api.get("/api/daily")
 async def api_daily(days: int = 30) -> list[dict]:
     """Per-day RTT/uptime stats for the last N days (HTTP and WebRTC)."""
-    cached = _daily_cache.get(days)
-    if cached is not None and time.time() - cached[0] < _DAILY_CACHE_TTL:
-        return cached[1]
-    cutoff = int((time.time() - days * 86400) * 1000)
-    result = await _bucket_stats(cutoff, 86_400_000)
-    _daily_cache[days] = (time.time(), result)
-    return result
+    DAY_MS    = 86_400_000
+    now_ms    = int(time.time() * 1000)
+    cutoff_ms = now_ms - days * DAY_MS
+
+    periods: dict[int, dict] = {}
+
+    async with _db.execute(
+        """
+        SELECT
+            (hour_ts / ?) * ?  AS day_ts,
+            type,
+            SUM(total)         AS total,
+            SUM(ok)            AS ok,
+            SUM(sum_rtt)       AS sum_rtt,
+            MIN(min_rtt)       AS min_rtt,
+            MAX(max_rtt)       AS max_rtt
+        FROM hourly_summary
+        WHERE hour_ts >= ? AND type IN ('http', 'webrtc')
+        GROUP BY day_ts, type
+        ORDER BY day_ts
+        """,
+        (DAY_MS, DAY_MS, cutoff_ms),
+    ) as cursor:
+        for day_ts, type_, total, ok, sum_rtt, min_rtt, max_rtt in await cursor.fetchall():
+            if day_ts not in periods:
+                periods[day_ts] = {"ts": day_ts}
+            avg_rtt = sum_rtt / ok if ok > 0 else None
+            periods[day_ts][type_] = {
+                "total": total, "ok": ok,
+                "uptime_pct":      round(ok / total * 100, 1)           if total else None,
+                "packet_loss_pct": round((total - ok) / total * 100, 2) if total else None,
+                "avg_rtt":  round(avg_rtt, 1) if avg_rtt  is not None else None,
+                "min_rtt":  round(min_rtt, 1) if min_rtt  is not None else None,
+                "max_rtt":  round(max_rtt, 1) if max_rtt  is not None else None,
+            }
+
+    return sorted(periods.values(), key=lambda x: x["ts"])
 
 
 app.include_router(_api)

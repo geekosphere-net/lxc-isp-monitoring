@@ -11,25 +11,27 @@ const RTT_GREEN_MAX    = 100;   // ms — ITU-T G.1010 interactive threshold
 const RTT_YELLOW_MAX   = 300;   // ms — noticeable lag in real-time apps
 
 // ── State ──
-let activeTab      = "realtime";
-let activeProbe    = "http";
-let histProbe      = "http";
-let statsHours     = 1;
-let bucketsCache   = {};     // bucketTs (ms) → { ts, http?, webrtc? }
-let recentResults  = [];     // last ~1 min of raw rows — status bar dots + last RTT
-let statsCache     = null;   // last /api/stats?hours=1 response — stats header
-let hourlyCache    = null;
-let dailyCache     = null;
-let outagesCache   = null;
-let histStatsCache     = null;   // /api/stats response for the history stats panel
-let histStatsHours     = null;   // statsHours value histStatsCache was fetched for
-let histStatsFetchedAt = 0;      // when histStatsCache was last populated
-let histSlowFetchedAt  = 0;      // when hourly/daily/outages were last populated
-const HIST_STATS_TTL_MS = 30_000;        // re-fetch stats on the same cadence as the realtime header
-const HIST_SLOW_TTL_MS  = 5 * 60_000;   // hourly/daily/outages refresh at most every 5 min
+let activeTab    = "realtime";
+let activeProbe  = "http";
+let histProbe    = "http";
+let bucketsCache = {};    // bucketTs (ms) → { ts, http?, webrtc? }
+let recentResults = [];   // last ~1 min of raw rows — status bar dots + last RTT
+let statsCache    = null; // last /api/stats?hours=1 response — stats header
+
+// Historical tab: per-window stats caches (1h, 24h, 7d all always shown)
+const HIST_STAT_WINDOWS  = [1, 24, 168];
+const HIST_STATS_TTL_MS  = 30_000;
+const HIST_SLOW_TTL_MS   = 5 * 60_000;
+let histStatsCaches    = {};  // hours → stats data
+let histCacheFetchedAt = {};  // hours → timestamp
+let hourlyCache        = null;
+let dailyCache         = null;
+let outagesCache       = null;
+let histSlowFetchedAt  = 0;
+
 let lastStatusTime = 0;
 let fetching       = false;
-let backendOnline  = null;   // null = unknown (initial), true = online, false = offline
+let backendOnline  = null;  // null = unknown (initial), true = online, false = offline
 
 // ── Backend connection badge ──
 function renderConnBadge() {
@@ -235,65 +237,48 @@ async function refreshStatus() {
 }
 
 // ── Historical tab ──
-// What gets fetched depends on which window is selected:
-//   1h  → stats only (fast, ~130ms)
-//   24h → stats + hourly strip + outages
-//   7d  → stats + hourly strip + daily calendar + outages
-// Each dataset is cached for the page session and re-used on subsequent
-// tab switches.  statsChanged=true forces stats to re-fetch (window changed).
-async function loadHistoryTab({ statsChanged = false } = {}) {
-  // Capture the window at call time — guards against the user clicking a
-  // different window button while a fetch is in-flight (race condition).
-  const hours = statsHours;
+// All three windows (1h / 24h / 7d) are always shown.  All six fetches fire
+// in parallel; each section renders as soon as its data arrives.
+async function loadHistoryTab() {
+  const now      = Date.now();
+  const slowStale = now - histSlowFetchedAt > HIST_SLOW_TTL_MS;
 
-  // Reveal/hide panels for the current window before any fetch
-  updateHistPanels();
-
-  // Render whatever is already cached (instant if returning to tab)
-  if (histStatsCache)                    renderStats(histStatsCache);
-  if (hourlyCache  && hours >= 24)       renderHourly(hourlyCache);
-  if (dailyCache   && hours >= 168)      renderDaily(dailyCache);
-  if (outagesCache && hours >= 24)       renderOutages(outagesCache);
-
-  const now  = Date.now();
-  const statsStale    = statsChanged
-    || !histStatsCache
-    || histStatsHours !== hours
-    || now - histStatsFetchedAt > HIST_STATS_TTL_MS;
-  const slowStale     = now - histSlowFetchedAt > HIST_SLOW_TTL_MS;
-  const hourlyNeeded  = hours >= 24  && (!hourlyCache  || slowStale);
-  const dailyNeeded   = hours >= 168 && (!dailyCache   || slowStale);
-  const outagesNeeded = hours >= 24  && (!outagesCache || slowStale);
-
-  if (!statsStale && !hourlyNeeded && !dailyNeeded && !outagesNeeded) return;
-
-  // Mark slow-data fetch time optimistically to prevent a storm if the user
-  // clicks quickly while fetches are in-flight.
-  if (hourlyNeeded || dailyNeeded || outagesNeeded) histSlowFetchedAt = now;
+  // Render cached data immediately (instant on return visits)
+  renderStats();
+  if (hourlyCache)  renderHourly(hourlyCache);
+  if (dailyCache)   renderDaily(dailyCache);
+  if (outagesCache) renderOutages(outagesCache);
 
   const work = [];
-  if (statsStale) {
-    work.push(fetchJSON(`/api/stats?hours=${hours}`).then(d => {
-      if (statsHours !== hours) return;  // user switched window — discard
-      histStatsCache = d; histStatsHours = hours; histStatsFetchedAt = Date.now();
-      renderStats(d);
-    }));
+
+  // Three stats windows — each refreshes on its own 30s TTL
+  for (const hours of HIST_STAT_WINDOWS) {
+    const stale = !histStatsCaches[hours]
+      || now - (histCacheFetchedAt[hours] || 0) > HIST_STATS_TTL_MS;
+    if (stale) {
+      work.push(
+        fetchJSON(`/api/stats?hours=${hours}`).then(d => {
+          histStatsCaches[hours]    = d;
+          histCacheFetchedAt[hours] = Date.now();
+          renderStats();
+        })
+      );
+    }
   }
-  if (hourlyNeeded) {
+
+  // Slow data — refresh at most every 5 min
+  if (!hourlyCache || slowStale) {
     work.push(fetchJSON("/api/hourly?hours=24").then(d => {
-      if (statsHours !== hours) return;
       hourlyCache = d; renderHourly(d);
-    }));
+    }).catch(() => {}));
   }
-  if (dailyNeeded) {
+  if (!dailyCache || slowStale) {
     work.push(fetchJSON("/api/daily?days=30").then(d => {
-      if (statsHours !== hours) return;
       dailyCache = d; renderDaily(d);
-    }));
+    }).catch(() => {}));
   }
-  if (outagesNeeded) {
+  if (!outagesCache || slowStale) {
     work.push(fetchJSON("/api/outages?days=7").then(d => {
-      if (statsHours !== hours) return;
       outagesCache = d; renderOutages(d);
     }).catch(() => {
       document.getElementById("outages-body").innerHTML =
@@ -301,16 +286,9 @@ async function loadHistoryTab({ statsChanged = false } = {}) {
     }));
   }
 
-  await Promise.all(work).catch(e => console.error("History fetch failed:", e));
-}
+  if (slowStale && work.length) histSlowFetchedAt = now;
 
-// Show/hide the 24h and 7d panels based on the selected window button.
-function updateHistPanels() {
-  const show24 = statsHours >= 24;
-  const show7d = statsHours >= 168;
-  document.getElementById("hist-heatmap-panel").classList.toggle("hidden", !show24);
-  document.getElementById("hist-daily-section").classList.toggle("hidden", !show7d);
-  document.getElementById("hist-outages-panel").classList.toggle("hidden", !show24);
+  await Promise.all(work).catch(e => console.error("History fetch failed:", e));
 }
 
 // ── Hourly strip (24 cells, one per hour) ──
@@ -430,22 +408,32 @@ function renderDaily(data) {
   }
 }
 
-function renderStats(stats) {
+// Render stats panel using all three cached windows (1h / 24h / 7d).
+// Called progressively as each window's fetch completes — shows "—" for
+// windows whose data hasn't arrived yet.
+function renderStats() {
   const grid  = document.getElementById("stats-grid");
   const types = { http: "HTTP", webrtc: "WebRTC", dns: "DNS" };
+
+  const triRtt = (a, b, c) => {
+    const vals = [a, b, c].map(v => v != null ? Math.round(v) : "—");
+    return vals.every(v => v === "—") ? "—" : vals.join(" / ") + " ms";
+  };
+  const triPct = (a, b, c) => {
+    const vals = [a, b, c].map(v => v != null ? v + "%" : "—");
+    return vals.every(v => v === "—") ? "—" : vals.join(" / ");
+  };
+
   grid.innerHTML = Object.entries(types).map(([key, label]) => {
-    const s = stats[key] || {};
-    const v   = (val, unit = "") => val != null ? `${val}${unit}` : "—";
-    const fms = val => val != null ? `${Math.round(val)} ms` : "—";
-    const minmax = (s.min_rtt != null && s.max_rtt != null)
-      ? `${Math.round(s.min_rtt)} / ${Math.round(s.max_rtt)} ms` : "—";
+    const d1   = (histStatsCaches[1]   || {})[key] || {};
+    const d24  = (histStatsCaches[24]  || {})[key] || {};
+    const d168 = (histStatsCaches[168] || {})[key] || {};
     return `
       <div class="stat-group">
         <div class="stat-group-title">${label}</div>
-        <div class="stat-row"><span class="stat-lbl">Uptime</span>      <span class="stat-val">${v(s.uptime_pct, "%")}</span></div>
-        <div class="stat-row"><span class="stat-lbl">Avg RTT</span>     <span class="stat-val">${fms(s.avg_rtt)}</span></div>
-        <div class="stat-row"><span class="stat-lbl">Min / Max</span>   <span class="stat-val">${minmax}</span></div>
-        <div class="stat-row"><span class="stat-lbl">Packet loss</span> <span class="stat-val">${v(s.packet_loss_pct, "%")}</span></div>
+        <div class="stat-row"><span class="stat-lbl">Uptime</span>      <span class="stat-val">${triPct(d1.uptime_pct, d24.uptime_pct, d168.uptime_pct)}</span></div>
+        <div class="stat-row"><span class="stat-lbl">Avg RTT</span>     <span class="stat-val">${triRtt(d1.avg_rtt, d24.avg_rtt, d168.avg_rtt)}</span></div>
+        <div class="stat-row"><span class="stat-lbl">Loss</span>        <span class="stat-val">${triPct(d1.packet_loss_pct, d24.packet_loss_pct, d168.packet_loss_pct)}</span></div>
       </div>`;
   }).join("");
 }
@@ -501,16 +489,6 @@ document.querySelectorAll(".hist-probe-btn").forEach(btn => {
     histProbe = btn.dataset.probe;
     if (hourlyCache) renderHourly(hourlyCache);
     if (dailyCache)  renderDaily(dailyCache);
-  });
-});
-
-// ── Window selector (historical tab) ──
-document.querySelectorAll(".win-btn").forEach(btn => {
-  btn.addEventListener("click", () => {
-    document.querySelectorAll(".win-btn").forEach(b => b.classList.remove("active"));
-    btn.classList.add("active");
-    statsHours = parseInt(btn.dataset.hours, 10);
-    loadHistoryTab({ statsChanged: true });
   });
 });
 

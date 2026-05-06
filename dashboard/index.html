@@ -92,17 +92,13 @@
     <section class="panel">
       <div class="panel-header">
         <h2>Statistics</h2>
-        <div class="window-btns">
-          <button class="win-btn active" data-hours="1">1h</button>
-          <button class="win-btn" data-hours="24">24h</button>
-          <button class="win-btn" data-hours="168">7d</button>
-        </div>
+        <span class="panel-subtitle stat-windows-label">1h / 24h / 7d</span>
       </div>
       <div id="stats-grid"></div>
     </section>
 
     <!-- Hourly + Daily latency heatmaps with shared probe toggle -->
-    <section id="hist-heatmap-panel" class="panel hidden">
+    <section id="hist-heatmap-panel" class="panel">
       <div class="panel-header">
         <h2>Latency Heatmap</h2>
         <div class="probe-toggle-wrap">
@@ -125,14 +121,14 @@
       <div class="hist-section-label">Hourly — Last 24 Hours</div>
       <div id="hourly-strip" class="hourly-strip"></div>
 
-      <div id="hist-daily-section" class="hidden">
+      <div id="hist-daily-section">
         <div class="hist-section-label" style="margin-top: 1.5rem;">Daily — Last 30 Days</div>
         <div id="daily-calendar"></div>
       </div>
     </section>
 
     <!-- Recent outages -->
-    <section id="hist-outages-panel" class="panel hidden">
+    <section id="hist-outages-panel" class="panel">
       <div class="panel-header">
         <h2 id="outages-heading">Recent Outages</h2>
         <span class="panel-subtitle">last 7 days · gaps &gt; 5 s with no successful ping</span>
