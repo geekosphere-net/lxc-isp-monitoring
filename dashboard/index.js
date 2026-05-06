@@ -20,6 +20,11 @@ let recentResults  = [];     // last ~1 min of raw rows — status bar dots + la
 let statsCache     = null;   // last /api/stats?hours=1 response — stats header
 let hourlyCache    = null;
 let dailyCache     = null;
+let outagesCache   = null;
+let histStatsCache = null;   // /api/stats response for the history stats panel
+let histStatsHours = null;   // statsHours value that histStatsCache was fetched with
+let histSlowFetchedAt = 0;   // when hourly/daily/outages were last fetched
+const HIST_SLOW_TTL_MS = 5 * 60 * 1000;  // re-fetch hourly/daily/outages at most every 5 min
 let lastStatusTime = 0;
 let fetching       = false;
 let backendOnline  = null;   // null = unknown (initial), true = online, false = offline
@@ -227,20 +232,38 @@ async function refreshStatus() {
 }
 
 // ── Historical tab ──
-async function loadHistoryTab() {
+// statsChanged=true forces a stats re-fetch even if the cache is warm (used
+// when the window selector changes).  Everything else uses a 5-minute TTL.
+async function loadHistoryTab({ statsChanged = false } = {}) {
+  const slowStale  = (Date.now() - histSlowFetchedAt) > HIST_SLOW_TTL_MS;
+  const statsStale = statsChanged || histStatsCache === null || histStatsHours !== statsHours;
+
+  // Render immediately from whatever cache we have — tab feels instant
+  if (histStatsCache) renderStats(histStatsCache);
+  if (outagesCache)   renderOutages(outagesCache);
+  if (hourlyCache)    renderHourly(hourlyCache);
+  if (dailyCache)     renderDaily(dailyCache);
+
+  if (!statsStale && !slowStale) return;
+
   try {
-    const [stats, outages, hourly, daily] = await Promise.all([
-      fetchJSON(`/api/stats?hours=${statsHours}`),
-      fetchJSON("/api/outages?days=7"),
-      fetchJSON("/api/hourly?hours=24"),
-      fetchJSON("/api/daily?days=30"),
-    ]);
-    renderStats(stats);
-    renderOutages(outages);
-    hourlyCache = hourly;
-    dailyCache  = daily;
-    renderHourly(hourly);
-    renderDaily(daily);
+    const work = [];
+    if (statsStale) {
+      work.push(
+        fetchJSON(`/api/stats?hours=${statsHours}`).then(d => {
+          histStatsCache = d; histStatsHours = statsHours; renderStats(d);
+        })
+      );
+    }
+    if (slowStale) {
+      histSlowFetchedAt = Date.now();  // optimistic — prevents parallel storm on fast clicks
+      work.push(
+        fetchJSON("/api/outages?days=7").then(d => { outagesCache = d; renderOutages(d); }),
+        fetchJSON("/api/hourly?hours=24").then(d => { hourlyCache  = d; renderHourly(d); }),
+        fetchJSON("/api/daily?days=30").then(d  => { dailyCache   = d; renderDaily(d);  }),
+      );
+    }
+    await Promise.all(work);
   } catch (e) {
     console.error("History fetch failed:", e);
   }
@@ -438,7 +461,7 @@ document.querySelectorAll(".win-btn").forEach(btn => {
     document.querySelectorAll(".win-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     statsHours = parseInt(btn.dataset.hours, 10);
-    loadHistoryTab();
+    loadHistoryTab({ statsChanged: true });
   });
 });
 
