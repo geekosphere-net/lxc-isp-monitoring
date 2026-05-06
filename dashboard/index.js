@@ -21,8 +21,12 @@ let statsCache     = null;   // last /api/stats?hours=1 response — stats heade
 let hourlyCache    = null;
 let dailyCache     = null;
 let outagesCache   = null;
-let histStatsCache = null;   // /api/stats response for the history stats panel
-let histStatsHours = null;   // statsHours value histStatsCache was fetched for
+let histStatsCache     = null;   // /api/stats response for the history stats panel
+let histStatsHours     = null;   // statsHours value histStatsCache was fetched for
+let histStatsFetchedAt = 0;      // when histStatsCache was last populated
+let histSlowFetchedAt  = 0;      // when hourly/daily/outages were last populated
+const HIST_STATS_TTL_MS = 30_000;        // re-fetch stats on the same cadence as the realtime header
+const HIST_SLOW_TTL_MS  = 5 * 60_000;   // hourly/daily/outages refresh at most every 5 min
 let lastStatusTime = 0;
 let fetching       = false;
 let backendOnline  = null;   // null = unknown (initial), true = online, false = offline
@@ -237,36 +241,60 @@ async function refreshStatus() {
 // Each dataset is cached for the page session and re-used on subsequent
 // tab switches.  statsChanged=true forces stats to re-fetch (window changed).
 async function loadHistoryTab({ statsChanged = false } = {}) {
+  // Capture the window at call time — guards against the user clicking a
+  // different window button while a fetch is in-flight (race condition).
+  const hours = statsHours;
+
   // Reveal/hide panels for the current window before any fetch
   updateHistPanels();
 
   // Render whatever is already cached (instant if returning to tab)
-  if (histStatsCache)                       renderStats(histStatsCache);
-  if (hourlyCache  && statsHours >= 24)     renderHourly(hourlyCache);
-  if (dailyCache   && statsHours >= 168)    renderDaily(dailyCache);
-  if (outagesCache && statsHours >= 24)     renderOutages(outagesCache);
+  if (histStatsCache)                    renderStats(histStatsCache);
+  if (hourlyCache  && hours >= 24)       renderHourly(hourlyCache);
+  if (dailyCache   && hours >= 168)      renderDaily(dailyCache);
+  if (outagesCache && hours >= 24)       renderOutages(outagesCache);
 
-  const statsStale   = statsChanged || !histStatsCache || histStatsHours !== statsHours;
-  const hourlyNeeded = statsHours >= 24  && !hourlyCache;
-  const dailyNeeded  = statsHours >= 168 && !dailyCache;
-  const outagesNeeded = statsHours >= 24 && !outagesCache;
+  const now  = Date.now();
+  const statsStale    = statsChanged
+    || !histStatsCache
+    || histStatsHours !== hours
+    || now - histStatsFetchedAt > HIST_STATS_TTL_MS;
+  const slowStale     = now - histSlowFetchedAt > HIST_SLOW_TTL_MS;
+  const hourlyNeeded  = hours >= 24  && (!hourlyCache  || slowStale);
+  const dailyNeeded   = hours >= 168 && (!dailyCache   || slowStale);
+  const outagesNeeded = hours >= 24  && (!outagesCache || slowStale);
 
   if (!statsStale && !hourlyNeeded && !dailyNeeded && !outagesNeeded) return;
 
+  // Mark slow-data fetch time optimistically to prevent a storm if the user
+  // clicks quickly while fetches are in-flight.
+  if (hourlyNeeded || dailyNeeded || outagesNeeded) histSlowFetchedAt = now;
+
   const work = [];
   if (statsStale) {
-    work.push(fetchJSON(`/api/stats?hours=${statsHours}`).then(d => {
-      histStatsCache = d; histStatsHours = statsHours; renderStats(d);
+    work.push(fetchJSON(`/api/stats?hours=${hours}`).then(d => {
+      if (statsHours !== hours) return;  // user switched window — discard
+      histStatsCache = d; histStatsHours = hours; histStatsFetchedAt = Date.now();
+      renderStats(d);
     }));
   }
   if (hourlyNeeded) {
-    work.push(fetchJSON("/api/hourly?hours=24").then(d => { hourlyCache  = d; renderHourly(d); }));
+    work.push(fetchJSON("/api/hourly?hours=24").then(d => {
+      if (statsHours !== hours) return;
+      hourlyCache = d; renderHourly(d);
+    }));
   }
   if (dailyNeeded) {
-    work.push(fetchJSON("/api/daily?days=30").then(d => { dailyCache = d; renderDaily(d); }));
+    work.push(fetchJSON("/api/daily?days=30").then(d => {
+      if (statsHours !== hours) return;
+      dailyCache = d; renderDaily(d);
+    }));
   }
   if (outagesNeeded) {
-    work.push(fetchJSON("/api/outages?days=7").then(d => { outagesCache = d; renderOutages(d); }));
+    work.push(fetchJSON("/api/outages?days=7").then(d => {
+      if (statsHours !== hours) return;
+      outagesCache = d; renderOutages(d);
+    }));
   }
 
   await Promise.all(work).catch(e => console.error("History fetch failed:", e));

@@ -140,14 +140,17 @@ WEBRTC_ENABLED = os.environ.get("WEBRTC_ENABLED", "true").lower() not in ("0", "
 # thread, so there is never more than one writer and no "database is locked".
 _db: aiosqlite.Connection | None = None
 
-# Server-side cache for the expensive 30-day daily aggregation.
-_daily_cache: tuple[float, list] | None = None  # (fetched_at_epoch, result)
+# Server-side cache for the expensive daily aggregation, keyed by days param.
+_daily_cache: dict[int, tuple[float, list]] = {}  # days → (fetched_at_epoch, result)
 _DAILY_CACHE_TTL = 300.0  # seconds
 
 # Shared counters passed to the server during WebRTC session negotiation
 # (mirrors what the browser frontend does)
 _num_successful = 0
 _num_timeout = 0
+# WebRTC-only success counter used for backoff decisions; _num_successful is
+# shared with the HTTP loop so it can't tell whether WebRTC itself produced pings.
+_webrtc_successful = 0
 
 try:
     from aiortc import RTCDataChannel, RTCPeerConnection, RTCSessionDescription
@@ -182,9 +185,11 @@ async def _init_db() -> aiosqlite.Connection:
         """
     )
     await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_ts ON pings(ts)")
-    await _db.execute("CREATE INDEX IF NOT EXISTS idx_pings_type_ts ON pings(type, ts)")
-    # Covering index lets the aggregation queries (stats, hourly, daily) be
-    # answered entirely from the index without touching main table pages.
+    # Covering index subsumes (type, ts) — drop the narrower index if it exists
+    # from a previous version to avoid paying write overhead for no benefit.
+    await _db.execute("DROP INDEX IF EXISTS idx_pings_type_ts")
+    # Covering index lets aggregation queries (stats, hourly, daily) be answered
+    # entirely from the index without touching main table pages.
     await _db.execute(
         "CREATE INDEX IF NOT EXISTS idx_pings_cover ON pings(type, ts, success, rtt_ms)"
     )
@@ -415,7 +420,7 @@ async def _webrtc_session() -> None:
                 await asyncio.sleep(PING_INTERVAL)
 
         async def _recv_loop() -> None:
-            global _num_successful, _num_timeout
+            global _num_successful, _num_timeout, _webrtc_successful
             consecutive_timeouts = 0
             while channel.readyState == "open":
                 # Wait up to PING_INTERVAL for a response, then fall through to
@@ -430,6 +435,7 @@ async def _webrtc_session() -> None:
                         rtt_ms = (time.monotonic() - t0) * 1000
                         consecutive_timeouts = 0
                         _num_successful += 1
+                        _webrtc_successful += 1
                         await _record("webrtc", True, rtt_ms)
                         logger.debug("WebRTC ping OK  %.1f ms", rtt_ms)
                     else:
@@ -437,21 +443,26 @@ async def _webrtc_session() -> None:
                 except asyncio.TimeoutError:
                     pass
 
-                # Expire outstanding pings older than 5 seconds
+                # Expire outstanding pings older than 5 seconds.
+                # Count one stall epoch per loop iteration regardless of how many
+                # pings expired — avoids killing the session when a burst of
+                # in-flight pings all expire simultaneously.
                 now = time.monotonic()
-                for ts_str in [k for k, t0 in list(outstanding.items()) if now - t0 > 5.0]:
+                expired = [k for k, t0 in list(outstanding.items()) if now - t0 > 5.0]
+                for ts_str in expired:
                     outstanding.pop(ts_str, None)
                     _num_timeout += 1
                     await _record("webrtc", False, error="timeout")
+                if expired:
                     consecutive_timeouts += 1
                     logger.debug(
-                        "WebRTC ping timeout (consecutive=%d/%d)",
-                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS,
+                        "WebRTC stall epoch %d/%d (%d ping(s) expired)",
+                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS, len(expired),
                     )
 
                 if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
                     logger.warning(
-                        "WebRTC session stalled (%d consecutive timeouts) — reconnecting",
+                        "WebRTC session stalled (%d consecutive epochs) — reconnecting",
                         consecutive_timeouts,
                     )
                     return
@@ -489,16 +500,16 @@ async def webrtc_ping_loop() -> None:
     logger.info("WebRTC ping loop starting → %s", TARGET_HOST)
     backoff = 2.0
     while True:
-        ok_before = _num_successful
+        ok_before = _webrtc_successful
         try:
             await _webrtc_session()
         except Exception as exc:
             logger.error("WebRTC session error: %s", exc)
             await _record("webrtc", False, error=str(exc)[:200])
-        # Reset backoff if the session produced any successful pings; only
+        # Reset backoff if the session produced any successful WebRTC pings; only
         # grow it on pure-failure sessions so reconnects stay fast after
         # transient stalls.
-        if _num_successful > ok_before:
+        if _webrtc_successful > ok_before:
             backoff = 2.0
         else:
             backoff = min(backoff * 2, 60.0)
@@ -708,12 +719,12 @@ async def api_hourly(hours: int = 24) -> list[dict]:
 @app.get("/api/daily")
 async def api_daily(days: int = 30) -> list[dict]:
     """Per-day RTT/uptime stats for the last N days (HTTP and WebRTC)."""
-    global _daily_cache
-    if _daily_cache is not None and time.time() - _daily_cache[0] < _DAILY_CACHE_TTL:
-        return _daily_cache[1]
+    cached = _daily_cache.get(days)
+    if cached is not None and time.time() - cached[0] < _DAILY_CACHE_TTL:
+        return cached[1]
     cutoff = int((time.time() - days * 86400) * 1000)
     result = await _bucket_stats(cutoff, 86_400_000)
-    _daily_cache = (time.time(), result)
+    _daily_cache[days] = (time.time(), result)
     return result
 
 
